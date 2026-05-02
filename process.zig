@@ -369,33 +369,277 @@ const LinuxBackend = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// MacOS
+// ---------------------------------------------------------------------------
+
+const darwin = std.posix.system;
+
+extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
+extern "c" fn proc_regionfilename(pid: c_int, address: u64, buffer: [*]u8, buffersize: u32) c_int;
+
 const MacOSBackend = struct {
-    // Might need to change this to mach_port_t probably
-    task: u32,
+    target_task: darwin.mach_port_t,
 
-    fn attach(_: std.Io, _: std.posix.pid_t) ProcessError!MacOSBackend {
-        // Maybe use task_for_pid?
-        @panic("TODO: implement attach for macOS backend");
+    fn attach(_: std.Io, pid: std.posix.pid_t) ProcessError!MacOSBackend {
+        var target_task: darwin.mach_port_t = undefined;
+        const kern_result = darwin.task_for_pid(darwin.mach_task_self(), pid, &target_task);
+
+        if (kern_result != 0) return ProcessError.AttachFailed;
+
+        return .{ .target_task = target_task };
     }
 
-    fn deinit(_: *MacOSBackend, _: std.Io) void {
-        // Maybe mach_port_deallocate?
-        @panic("TODO: implement deinit for macOS backend");
+    fn deinit(self: *MacOSBackend, _: std.Io) void {
+        _ = darwin.mach_port_deallocate(darwin.mach_task_self(), self.target_task);
     }
 
-    fn read(_: *MacOSBackend, _: std.Io, _: usize, _: []u8) ProcessError!usize {
-        // Use mach_vm_read_overwrite
-        @panic("TODO: implement read for macOS backend");
+    fn read(self: *MacOSBackend, _: std.Io, addr: usize, buf: []u8) ProcessError!usize {
+        // We want to gate mach_vm_read size due to the allocations it does.
+        const max_chunk: usize = 64 * 1024;
+        var nread: usize = 0;
+
+        while (nread < buf.len) {
+            const remaining = buf.len - nread;
+            const read_size = @min(remaining, max_chunk);
+
+            // mach_vm_read allocates memory in our own process space and then copies bytes from the target_task
+            // addr to the allocated data buffer.
+            // data_addr represents the address where our newly allocated memory containing the data resides.
+            // data_count represents the size of copied bytes.
+            var data_addr: darwin.vm_offset_t = 0;
+            var data_count: darwin.mach_msg_type_number_t = 0;
+            const kern_result = darwin.mach_vm_read(self.target_task, addr + nread, read_size, &data_addr, &data_count);
+
+            if (kern_result != 0) return if (nread == 0) ProcessError.ReadFailed else nread;
+            if (data_count == 0) break;
+
+            const read_count = @min(read_size, data_count);
+
+            const src: [*]const u8 = @ptrFromInt(data_addr);
+            @memcpy(buf[nread .. nread + read_count], src[0..read_count]);
+
+            // We have to deallocate mach_vm_read allocations once we've copied the data to our internal buffer.
+            _ = darwin.vm_deallocate(darwin.mach_task_self(), data_addr, data_count);
+
+            nread += read_count;
+            if (read_count < read_size) break;
+        }
+
+        return nread;
     }
 
-    fn write(_: *MacOSBackend, _: std.Io, _: usize, _: []const u8) ProcessError!void {
-        // Use mach_vm_write
-        @panic("TODO: implement write for macOS backend");
+    fn write(self: *MacOSBackend, _: std.Io, addr: usize, data: []const u8) ProcessError!void {
+        if (data.len == 0) return;
+
+        // Might need mach_vm_protect to change region protections to write to un-writtable regions.
+        // Usually we'd ignore those but programs (like PINCE) can scan non-writtable regions.
+        // TODO: Decide if libmemscan should forcibly write to write-disabled regions.
+        const kern_result = darwin.mach_vm_write(self.target_task, addr, @intFromPtr(data.ptr), @intCast(data.len));
+        if (kern_result != 0) return ProcessError.WriteFailed;
     }
 
-    fn readRegions(_: *MacOSBackend, _: std.Io, _: std.posix.pid_t, _: std.mem.Allocator, _: ScanLevel) ProcessError![]Region {
-        // Use mach_vm_region
-        @panic("TODO: implement readRegions for macOS backend");
+    fn readRegions(self: *MacOSBackend, io: std.Io, pid: std.posix.pid_t, allocator: std.mem.Allocator, level: ScanLevel) ProcessError![]Region {
+        var regions: std.ArrayList(Region) = .empty;
+        errdefer {
+            for (regions.items) |*r| r.deinit(allocator);
+            regions.deinit(allocator);
+        }
+
+        // Tracking Mach-O images
+        const ImageLoad = struct {
+            filename: []const u8,
+            load_addr: usize,
+            dev: i32,
+            ino: std.c.ino_t,
+            has_identity: bool,
+        };
+
+        const SM_COW: u8 = 1;
+        const SM_PRIVATE: u8 = 2;
+        const SM_SHARED: u8 = 4;
+        const SM_TRUESHARED: u8 = 5;
+        const SM_PRIVATE_ALIASED: u8 = 6;
+        const SM_SHARED_ALIASED: u8 = 7;
+        const KERN_INVALID_ADDRESS: darwin.kern_return_t = 1;
+
+        const VM_MEMORY_MALLOC_FIRST: u32 = 1;
+        const VM_MEMORY_MALLOC_LAST: u32 = 9;
+        const VM_MEMORY_MALLOC_NANO: u32 = 11;
+        const VM_MEMORY_MALLOC_PROB_GUARD: u32 = 13;
+        const VM_MEMORY_STACK: u32 = 30;
+
+        var image_loads: std.ArrayList(ImageLoad) = .empty;
+        defer {
+            for (image_loads.items) |load| allocator.free(load.filename);
+            image_loads.deinit(allocator);
+        }
+
+        // Grab executable name for specified PID.
+        var exe_name_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var exe_name: []const u8 = "";
+        var exe_stat: std.c.Stat = undefined;
+        var exe_has_identity = false;
+        const exe_name_raw_len = proc_pidpath(@intCast(pid), &exe_name_buf, @intCast(exe_name_buf.len));
+        if (exe_name_raw_len > 0) {
+            const exe_name_len = @min(@as(usize, @intCast(exe_name_raw_len)), exe_name_buf.len);
+            const exe_name_path = exe_name_buf[0..exe_name_len];
+            exe_name = exe_name_path[0 .. std.mem.indexOfScalar(u8, exe_name_path, 0) orelse exe_name_path.len];
+            if (exe_name.len < exe_name_buf.len) {
+                exe_name_buf[exe_name.len] = 0;
+                exe_has_identity = std.c.fstatat(std.c.AT.FDCWD, @ptrCast(exe_name_buf[0..].ptr), &exe_stat, 0) == 0;
+            }
+        }
+
+        // Note that address is an in/out variable. When calling mach_vm_region*, we supply it an address of where to begin searching
+        // where upon return, it's populated with the address of a found region.
+        var address: darwin.mach_vm_address_t = 0;
+        var depth: darwin.natural_t = 0;
+        var region_id: u32 = 0;
+        var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+        while (true) {
+            var region_size: darwin.mach_vm_size_t = 0;
+            var info: darwin.vm_region_submap_info_64 = undefined;
+            var info_count: darwin.mach_msg_type_number_t = darwin.VM.REGION.SUBMAP_INFO_COUNT_64;
+
+            const kern_result = darwin.mach_vm_region_recurse(self.target_task, &address, &region_size, &depth, @ptrCast(&info), &info_count);
+            if (kern_result == KERN_INVALID_ADDRESS) break;
+            if (kern_result != 0) return ProcessError.RegionEnumFailed;
+            if (region_size == 0) break;
+
+            if (info.is_submap != 0) {
+                depth += 1;
+                continue;
+            }
+
+            const next_address = std.math.add(darwin.mach_vm_address_t, address, region_size) catch break;
+            defer address = next_address;
+
+            const region_flags = RegionFlags{
+                .read = info.protection.READ,
+                .write = info.protection.WRITE,
+                .exec = info.protection.EXEC,
+                .shared = info.share_mode == SM_SHARED or
+                    info.share_mode == SM_TRUESHARED or
+                    info.share_mode == SM_SHARED_ALIASED,
+                .private = info.share_mode == SM_PRIVATE or
+                    info.share_mode == SM_PRIVATE_ALIASED or
+                    info.share_mode == SM_COW,
+            };
+
+            if (!region_flags.read) continue;
+
+            // Grab the filename that backs up this region
+            // If empty (""), might be anonymous region which is the equivalent of Linux BSS.
+            var filename: []const u8 = "";
+            const filename_raw_len = proc_regionfilename(@intCast(pid), @intCast(address), &filename_buf, @intCast(filename_buf.len));
+            if (filename_raw_len > 0) {
+                const filename_len = @min(@as(usize, @intCast(filename_raw_len)), filename_buf.len);
+                const filename_path = filename_buf[0..filename_len];
+                filename = filename_path[0 .. std.mem.indexOfScalar(u8, filename_path, 0) orelse filename_path.len];
+            }
+
+            // If region has a filename, let's grab the fstat so we can also compare using dev and ino
+            // instead of just comparing path strings.
+            var filename_stat: std.c.Stat = undefined;
+            const filename_has_identity = filename.len > 0 and filename.len < filename_buf.len and blk: {
+                filename_buf[filename.len] = 0;
+                break :blk std.c.fstatat(std.c.AT.FDCWD, @ptrCast(filename_buf[0..].ptr), &filename_stat, 0) == 0;
+            };
+
+            // Main executable region if same device and inode as the filename of the PID.
+            // Fallback to filename path equality checking.
+            const main_executable_region = filename.len > 0 and
+                ((exe_has_identity and filename_has_identity and exe_stat.dev == filename_stat.dev and exe_stat.ino == filename_stat.ino) or
+                    (exe_name.len > 0 and std.mem.eql(u8, filename, exe_name)));
+
+            var load_addr = address; // Initialize load address with the region start address as fallback.
+            if (filename.len > 0 and (region_flags.exec or main_executable_region)) {
+                var found_load_addr = false;
+
+                // Do we already have a cached image load addr for this filename?
+                // Same method as .EXE checking, use dev and ino before falling back to str equality.
+                for (image_loads.items) |load| {
+                    const same_image = if (load.has_identity and filename_has_identity)
+                        load.dev == filename_stat.dev and load.ino == filename_stat.ino
+                    else
+                        std.mem.eql(u8, load.filename, filename);
+
+                    if (same_image) {
+                        load_addr = load.load_addr;
+                        found_load_addr = true;
+                        break;
+                    }
+                }
+
+                // We didn't have a cached load addr, so we'll have to manually check and cache if found
+                if (!found_load_addr and region_flags.exec and region_size >= @sizeOf(u32)) {
+                    // If this is an executable region, read the first 4 bytes of this region and check for Mach-O magic.
+                    var magic_buf: [@sizeOf(u32)]u8 = undefined;
+                    if ((self.read(io, address, magic_buf[0..]) catch 0) == magic_buf.len) {
+                        const magic = std.mem.readInt(u32, &magic_buf, .little);
+
+                        // If we indeed classified this file as Mach-O using the magic at the start of region, cache this image load for other regions' checks.
+                        if (magic == std.macho.MH_MAGIC or magic == std.macho.MH_MAGIC_64) {
+                            load_addr = address;
+
+                            const image_filename = allocator.dupe(u8, filename) catch return ProcessError.RegionEnumFailed;
+                            image_loads.append(allocator, .{
+                                .filename = image_filename,
+                                .load_addr = address,
+                                .dev = if (filename_has_identity) filename_stat.dev else 0,
+                                .ino = if (filename_has_identity) filename_stat.ino else 0,
+                                .has_identity = filename_has_identity,
+                            }) catch {
+                                allocator.free(image_filename);
+                                return ProcessError.RegionEnumFailed;
+                            };
+                        }
+                    }
+                }
+            }
+
+            const kind: RegionKind = blk: {
+                if (info.user_tag == VM_MEMORY_STACK) break :blk .STACK;
+                if (main_executable_region) break :blk .EXE;
+                if (region_flags.exec) break :blk .CODE;
+                if (filename.len == 0 and ((info.user_tag >= VM_MEMORY_MALLOC_FIRST and info.user_tag <= VM_MEMORY_MALLOC_LAST) or
+                    (info.user_tag >= VM_MEMORY_MALLOC_NANO and info.user_tag <= VM_MEMORY_MALLOC_PROB_GUARD)))
+                {
+                    break :blk .HEAP;
+                }
+
+                break :blk .MISC;
+            };
+
+            // We do two calls to isUsefulRegion because main_executable_region can be based on dev+ino checks
+            // instead of the filename == exe_name checks like Linux is doing, so we have to double check with
+            // a explicit filename == filename in case the first one returns a false positive.
+            if (!isUsefulRegion(kind, region_flags, filename, exe_name, level) and
+                !(main_executable_region and isUsefulRegion(kind, region_flags, filename, filename, level)))
+            {
+                continue;
+            }
+
+            const filename_copy = allocator.dupe(u8, filename) catch return ProcessError.RegionEnumFailed;
+            regions.append(allocator, .{
+                .start = address,
+                .size = region_size,
+                .kind = kind,
+                .flags = region_flags,
+                .load_addr = load_addr,
+                .id = region_id,
+                .filename = filename_copy,
+            }) catch {
+                allocator.free(filename_copy);
+                return ProcessError.RegionEnumFailed;
+            };
+
+            region_id += 1;
+        }
+
+        return regions.toOwnedSlice(allocator) catch return ProcessError.RegionEnumFailed;
     }
 };
 
@@ -403,7 +647,7 @@ const MacOSBackend = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parseMapsLine: normal executable region" {
+test "[Linux] parseMapsLine: normal executable region" {
     const line = "7f1234560000-7f1234561000 r-xp 00000000 08:01 99999 /usr/lib/libc.so.6";
     const result = parseMapsLine(line).?;
     try std.testing.expectEqual(@as(usize, 0x7f1234560000), result.start);
@@ -415,7 +659,7 @@ test "parseMapsLine: normal executable region" {
     try std.testing.expectEqualStrings("/usr/lib/libc.so.6", result.pathname);
 }
 
-test "parseMapsLine: anonymous rw region (heap-like)" {
+test "[Linux] parseMapsLine: anonymous rw region (heap-like)" {
     const line = "55a000000000-55a000010000 rw-p 00000000 00:00 0 ";
     const result = parseMapsLine(line).?;
     try std.testing.expect(result.flags.read);
@@ -424,13 +668,13 @@ test "parseMapsLine: anonymous rw region (heap-like)" {
     try std.testing.expectEqualStrings("", result.pathname);
 }
 
-test "parseMapsLine: [heap] region" {
+test "[Linux] parseMapsLine: [heap] region" {
     const line = "55b000000000-55b000100000 rw-p 00000000 00:00 0            [heap]";
     const result = parseMapsLine(line).?;
     try std.testing.expectEqualStrings("[heap]", result.pathname);
 }
 
-test "parseMapsLine: malformed line returns null" {
+test "[Linux] parseMapsLine: malformed line returns null" {
     try std.testing.expectEqual(@as(?MapsLine, null), parseMapsLine("not a maps line"));
 }
 
