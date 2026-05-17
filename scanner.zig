@@ -18,6 +18,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const pointerscan = @import("pointerscan.zig");
 const process = @import("process.zig");
 const scanroutines = @import("scanroutines.zig");
 const targetmem = @import("targetmem.zig");
@@ -61,7 +62,7 @@ pub const ScannerError = error{
     UnsupportedScanCombination,
     UnsupportedReadDataType,
     UnsupportedWriteDataType,
-} || ProcessError || StorageError;
+} || ProcessError || StorageError || pointerscan.PointerScanError;
 
 pub const ScanOptions = struct {
     alignment: u16 = 1,
@@ -128,7 +129,7 @@ const UndoFileHeader = extern struct {
     scan_data_type: u16,
     scan_level: u16,
     reverse_endianness: u8,
-    _padding: [5]u8 = [_]u8{0} ** 5,
+    _padding: [5]u8 = @splat(0),
 
     fn init(scanner: *const Scanner, matches: *const MatchesArray) UndoFileHeader {
         return .{
@@ -423,6 +424,91 @@ pub const Scanner = struct {
         try self.scan(.MATCHUPDATE, &.{});
     }
 
+    pub fn scanPointers(
+        self: *Scanner,
+        target_address: usize,
+        output_map_path: []const u8,
+        options: pointerscan.PointerScanOptions,
+    ) ScannerError!u64 {
+        if (self.process_handle == null) return ScannerError.NotAttached;
+        if (self.regions.len == 0) return ScannerError.NoRegions;
+        const handle = &self.process_handle.?;
+        const max_read_size = try options.maxChunkReadSize();
+
+        const output_map_file = std.Io.Dir.createFileAbsolute(self.io, output_map_path, .{
+            .read = true,
+            .truncate = true,
+        }) catch return ScannerError.MapCreateFailed;
+        var output_file_owned = true;
+        errdefer if (output_file_owned) output_map_file.close(self.io);
+
+        var entries: std.ArrayList(pointerscan.PointerEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        // This type works as a sort of filter for pointer values so when we check each pointer during reads
+        // we can immediately determine if the pointed value is inside a readable regions.
+        var valid_pointer_values = try pointerscan.ValidPointerValueRanges.init(self.allocator, self.regions);
+        defer valid_pointer_values.deinit();
+
+        self.scan_progress = 0;
+        self.stop_flag = false;
+        if (valid_pointer_values.len() != 0) {
+            const buffer = self.allocator.alloc(u8, max_read_size) catch return ScannerError.OutOfMemory;
+            defer self.allocator.free(buffer);
+
+            const total_bytes = totalRegionBytes(self.regions);
+
+            var processed_bytes: usize = 0;
+            for (self.regions) |region| {
+                if (!region.flags.read or region.size < options.pointer_width) continue;
+
+                var region_offset: usize = 0;
+                while (region_offset < region.size) {
+                    if (self.stop_flag) break;
+
+                    const region_remaining = region.size - region_offset;
+                    const read_size = @min(region_remaining, max_read_size);
+
+                    const chunk_address = region.start + region_offset;
+                    const bytes_read = handle.read(chunk_address, buffer[0..read_size]) catch break;
+                    if (bytes_read == 0) break;
+
+                    const scan_advance = try pointerscan.appendEntriesFromChunk(self.allocator, &entries, chunk_address, buffer[0..bytes_read], options, &valid_pointer_values);
+                    if (scan_advance == 0) break;
+
+                    region_offset += scan_advance;
+                    processed_bytes += scan_advance;
+                    self.scan_progress = if (total_bytes == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed_bytes)) / @as(f64, @floatFromInt(total_bytes)));
+                }
+
+                if (self.stop_flag) break;
+            }
+        }
+        self.scan_progress = 1.0;
+
+        var index = try pointerscan.PointerReverseIndex.fromEntries(self.allocator, entries.items);
+        defer index.deinit();
+
+        const modules = try pointerscan.moduleBasesFromRegions(self.allocator, self.regions);
+        defer self.allocator.free(modules);
+
+        output_file_owned = false;
+        var map_writer = try pointerscan.PointerMapWriter.init(self.io, output_map_file, options.pointer_width, modules);
+        defer map_writer.deinit();
+
+        const paths_found = try pointerscan.findPointerPaths(
+            self.allocator,
+            &index,
+            modules,
+            options,
+            target_address,
+            &map_writer,
+        );
+        try map_writer.finish();
+
+        return paths_found;
+    }
+
     pub fn readBytes(self: *Scanner, address: usize, buf: []u8) ScannerError!usize {
         if (self.process_handle) |*handle| {
             return handle.read(address, buf);
@@ -597,7 +683,7 @@ pub const Scanner = struct {
                     &self.num_matches,
                 );
 
-                region_offset += scanLimitAdvance(scan_chunk.scan_limit);
+                region_offset += scan_chunk.scan_limit;
                 processed_bytes += scan_chunk.scan_limit;
                 self.scan_progress = if (total_bytes == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed_bytes)) / @as(f64, @floatFromInt(total_bytes)));
 
@@ -791,7 +877,7 @@ const MemoryCache = struct {
     const read_chunk_size: usize = 2048;
     const max_size: usize = (1 << 16) + read_chunk_size;
 
-    cache: [max_size]u8 = [_]u8{0} ** max_size,
+    cache: [max_size]u8 = @splat(0),
     size: usize = 0,
     base: ?usize = null,
 
@@ -1053,10 +1139,6 @@ fn calculateMaxMatchStorage(regions: []const Region) usize {
     return total;
 }
 
-fn scanLimitAdvance(scan_limit: usize) usize {
-    return if (scan_limit == 0) 0 else scan_limit;
-}
-
 fn regionIdIncluded(region_id: u32, region_ids: []const usize) bool {
     for (region_ids) |candidate| {
         if (candidate > std.math.maxInt(u32)) continue;
@@ -1094,6 +1176,77 @@ test "prepareScan: requires attachment" {
 
     const user = try UserValue.parseNumber("5");
     try std.testing.expectError(ScannerError.NotAttached, scanner.prepareScan(.MATCHEQUALTO, &.{user}));
+}
+
+test "scanPointers: scans process memory and writes direct and nested pointer paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const memory = try allocator.alignedAlloc(u8, std.mem.Alignment.of(usize), 0x100);
+    defer allocator.free(memory);
+    @memset(memory, 0);
+
+    const base_address = @intFromPtr(memory.ptr);
+    const middle_pointer_address = base_address + 0x40;
+    const target_address = base_address + 0x90;
+
+    std.mem.writeInt(usize, memory[0x10..][0..@sizeOf(usize)], middle_pointer_address - 0x10, .native);
+    std.mem.writeInt(usize, memory[0x40..][0..@sizeOf(usize)], target_address - 0x8, .native);
+
+    const pid = std.c.getpid();
+    var scanner = Scanner.init(allocator, io);
+    defer scanner.deinit();
+
+    // Open the process directly so this test can install one synthetic region below.
+    // Scanner.attach would reload the full process map and make it wasteful.
+    scanner.process_handle = ProcessHandle.attach(io, pid) catch |err| switch (err) {
+        ProcessError.AttachFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    scanner.target_pid = pid;
+    scanner.fresh_session = true;
+
+    scanner.regions = try allocator.alloc(Region, 1);
+    scanner.regions[0] = .{
+        .start = base_address,
+        .size = memory.len,
+        .kind = .EXE,
+        .flags = .{ .read = true, .write = true, .exec = false, .shared = false, .private = true },
+        .load_addr = base_address,
+        .id = 0,
+        .filename = try allocator.dupe(u8, "/tmp/libmemscan-pointer-test-module"),
+    };
+
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    var map_path_buffer: [128]u8 = undefined;
+    const map_path = try std.fmt.bufPrint(&map_path_buffer, "/tmp/libmemscan-pointer-scan-{d}-{x}.lmptr", .{
+        pid,
+        std.mem.readInt(u64, &random_bytes, .native),
+    });
+    defer std.Io.Dir.deleteFileAbsolute(io, map_path) catch {};
+
+    const paths_found = try scanner.scanPointers(target_address, map_path, .{
+        .pointer_width = @sizeOf(usize),
+        .max_depth = 2,
+        .max_positive_offset = 0x20,
+    });
+    try std.testing.expectEqual(@as(u64, 2), paths_found);
+    try std.testing.expectEqual(@as(f64, 1), scanner.scan_progress);
+
+    const read_file = try std.Io.Dir.openFileAbsolute(io, map_path, .{});
+    var reader = try pointerscan.PointerMapReader.init(allocator, io, read_file);
+    defer reader.deinit();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try reader.dumpText(&out.writer);
+
+    try std.testing.expectEqualStrings(
+        \\libmemscan-pointer-test-module+0x40 -> 0x8
+        \\libmemscan-pointer-test-module+0x10 -> 0x10 -> 0x8
+        \\
+    , out.written());
 }
 
 test "ensureMatchStorage: allocates lazily" {

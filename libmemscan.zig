@@ -25,6 +25,7 @@ pub const value = @import("value.zig");
 pub const targetmem = @import("targetmem.zig");
 pub const scanroutines = @import("scanroutines.zig");
 pub const scanner = @import("scanner.zig");
+pub const pointerscan = @import("pointerscan.zig");
 
 pub const MatchFlags = value.MatchFlags;
 pub const Value = value.Value;
@@ -37,6 +38,16 @@ pub const UserValue = scanner.UserValue;
 pub const Scanner = scanner.Scanner;
 pub const ScannerError = scanner.ScannerError;
 pub const ScanOptions = scanner.ScanOptions;
+pub const ModuleBase = pointerscan.ModuleBase;
+pub const PointerEntry = pointerscan.PointerEntry;
+pub const PointerScanOptions = pointerscan.PointerScanOptions;
+pub const PointerReverseIndex = pointerscan.PointerReverseIndex;
+pub const PointerBase = pointerscan.PointerBase;
+pub const PointerPath = pointerscan.PointerPath;
+pub const OwnedPointerPath = pointerscan.OwnedPointerPath;
+pub const PointerMapWriter = pointerscan.PointerMapWriter;
+pub const PointerMapReader = pointerscan.PointerMapReader;
+pub const PointerScanError = pointerscan.PointerScanError;
 
 const c_allocator = std.heap.c_allocator;
 
@@ -74,6 +85,14 @@ pub const LmStatus = enum(c_int) {
     PARSE_FAILED = 24,
     CONVERSION_FAILED = 25,
     INTERNAL_ERROR = 26,
+    INVALID_POINTER_MAP_DATA = 27,
+    INVALID_POINTER_MAP_FORMAT = 28,
+    INVALID_POINTER_SCAN_OPTIONS = 29,
+    UNSUPPORTED_POINTER_MAP_VERSION = 30,
+    POINTER_MODULE_INDEX_OUT_OF_RANGE = 31,
+    POINTER_MAP_CREATE_FAILED = 32,
+    POINTER_MAP_READ_FAILED = 33,
+    POINTER_MAP_WRITE_FAILED = 34,
 };
 
 pub const LmDataType = enum(c_int) {
@@ -113,6 +132,12 @@ pub const LmScanLevel = enum(c_int) {
     HEAP_STACK_EXE_BSS = 3,
 };
 
+pub const LmPointerEndianness = enum(c_int) {
+    NATIVE = 0,
+    LITTLE = 1,
+    BIG = 2,
+};
+
 pub const LmMatchRecord = extern struct {
     index: usize,
     address: usize,
@@ -128,6 +153,17 @@ pub const LmRegionRecord = extern struct {
     kind: c_int,
     flags_bits: u8,
     load_addr: usize,
+};
+
+pub const LmPointerScanOptions = extern struct {
+    pointer_width: u8,
+    max_depth: u8,
+    module_base_only: bool,
+    has_max_results: bool,
+    endianness: c_int,
+    max_positive_offset: usize,
+    max_negative_offset: usize,
+    max_results: u64,
 };
 
 pub const LmUserValue = extern struct {
@@ -156,6 +192,13 @@ fn fromHandle(handle: *AbiScanner) *LmScanner {
     return @ptrCast(handle);
 }
 
+fn absolutePathFromAbi(raw: ?[*:0]const u8) ?[]const u8 {
+    const ptr = raw orelse return null;
+    const path = std.mem.span(ptr);
+    if (path.len == 0 or !std.Io.Dir.path.isAbsolute(path)) return null;
+    return path;
+}
+
 fn statusFrom(err: anyerror) LmStatus {
     return switch (err) {
         error.InvalidArgument => .INVALID_ARGUMENT,
@@ -181,6 +224,14 @@ fn statusFrom(err: anyerror) LmStatus {
         error.WriteFailed => .WRITE_FAILED,
         error.RegionEnumFailed => .REGION_ENUM_FAILED,
         error.OutOfMemory => .OUT_OF_MEMORY,
+        error.InvalidMapData => .INVALID_POINTER_MAP_DATA,
+        error.InvalidMapFormat => .INVALID_POINTER_MAP_FORMAT,
+        error.InvalidOptions => .INVALID_POINTER_SCAN_OPTIONS,
+        error.UnsupportedMapVersion => .UNSUPPORTED_POINTER_MAP_VERSION,
+        error.ModuleIndexOutOfRange => .POINTER_MODULE_INDEX_OUT_OF_RANGE,
+        error.MapCreateFailed => .POINTER_MAP_CREATE_FAILED,
+        error.MapReadFailed => .POINTER_MAP_READ_FAILED,
+        error.MapWriteFailed => .POINTER_MAP_WRITE_FAILED,
         error.InvalidCharacter,
         error.Overflow,
         error.Empty,
@@ -272,6 +323,14 @@ pub export fn lm_status_name(status_code: c_int) [*:0]const u8 {
         @intFromEnum(LmStatus.PARSE_FAILED) => "PARSE_FAILED",
         @intFromEnum(LmStatus.CONVERSION_FAILED) => "CONVERSION_FAILED",
         @intFromEnum(LmStatus.INTERNAL_ERROR) => "INTERNAL_ERROR",
+        @intFromEnum(LmStatus.INVALID_POINTER_MAP_DATA) => "INVALID_POINTER_MAP_DATA",
+        @intFromEnum(LmStatus.INVALID_POINTER_MAP_FORMAT) => "INVALID_POINTER_MAP_FORMAT",
+        @intFromEnum(LmStatus.INVALID_POINTER_SCAN_OPTIONS) => "INVALID_POINTER_SCAN_OPTIONS",
+        @intFromEnum(LmStatus.UNSUPPORTED_POINTER_MAP_VERSION) => "UNSUPPORTED_POINTER_MAP_VERSION",
+        @intFromEnum(LmStatus.POINTER_MODULE_INDEX_OUT_OF_RANGE) => "POINTER_MODULE_INDEX_OUT_OF_RANGE",
+        @intFromEnum(LmStatus.POINTER_MAP_CREATE_FAILED) => "POINTER_MAP_CREATE_FAILED",
+        @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED) => "POINTER_MAP_READ_FAILED",
+        @intFromEnum(LmStatus.POINTER_MAP_WRITE_FAILED) => "POINTER_MAP_WRITE_FAILED",
         else => "INVALID_STATUS",
     };
 }
@@ -430,6 +489,80 @@ pub export fn lm_scan(raw: ?*LmScanner, match_type: c_int, value1: ?*const LmUse
     }
 
     handle.scanner.scan(match_enum, user_values[0..user_value_len]) catch |err| return @intFromEnum(statusFrom(err));
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_pointer_scan(raw: ?*LmScanner, target_address: usize, output_map_path: ?[*:0]const u8, options: ?*const LmPointerScanOptions, out_paths_found: ?*u64) c_int {
+    const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const path = absolutePathFromAbi(output_map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const scan_options: PointerScanOptions = if (options) |abi| .{
+        .pointer_width = abi.pointer_width,
+        .endianness = switch (abi.endianness) {
+            @intFromEnum(LmPointerEndianness.NATIVE) => .native,
+            @intFromEnum(LmPointerEndianness.LITTLE) => .little,
+            @intFromEnum(LmPointerEndianness.BIG) => .big,
+            else => return @intFromEnum(LmStatus.INVALID_POINTER_SCAN_OPTIONS),
+        },
+        .max_depth = abi.max_depth,
+        .max_positive_offset = abi.max_positive_offset,
+        .max_negative_offset = abi.max_negative_offset,
+        .max_results = if (abi.has_max_results) abi.max_results else null,
+        .module_base_only = abi.module_base_only,
+    } else .{};
+    const paths_found = handle.scanner.scanPointers(target_address, path, scan_options) catch |err| return @intFromEnum(statusFrom(err));
+
+    if (out_paths_found) |out| out.* = paths_found;
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_pointer_map_compare(previous_map_path: ?[*:0]const u8, current_map_path: ?[*:0]const u8, output_map_path: ?[*:0]const u8, out_paths_found: ?*u64) c_int {
+    const previous_path = absolutePathFromAbi(previous_map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const current_path = absolutePathFromAbi(current_map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const output_path = absolutePathFromAbi(output_map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    if (std.mem.eql(u8, output_path, previous_path) or std.mem.eql(u8, output_path, current_path)) return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const previous_file = std.Io.Dir.openFileAbsolute(io, previous_path, .{}) catch return @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED);
+    var previous_file_owned = true;
+    errdefer if (previous_file_owned) previous_file.close(io);
+
+    const current_file = std.Io.Dir.openFileAbsolute(io, current_path, .{}) catch return @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED);
+    var current_file_owned = true;
+    errdefer if (current_file_owned) current_file.close(io);
+
+    const output_file = std.Io.Dir.createFileAbsolute(io, output_path, .{ .read = true, .truncate = true }) catch return @intFromEnum(LmStatus.POINTER_MAP_CREATE_FAILED);
+    var output_file_owned = true;
+    errdefer if (output_file_owned) output_file.close(io);
+
+    previous_file_owned = false;
+    current_file_owned = false;
+    output_file_owned = false;
+    const paths_found = pointerscan.comparePointerMaps(c_allocator, io, previous_file, current_file, output_file) catch |err| return @intFromEnum(statusFrom(err));
+
+    if (out_paths_found) |out| out.* = paths_found;
+    return @intFromEnum(LmStatus.OK);
+}
+
+// TODO: Should replace this temporary dump API with a streaming pointer map reader
+// so we avoid making another text file but dump the output into a window without huge allocations.
+pub export fn lm_pointer_map_dump_text(map_path: ?[*:0]const u8, output_text_path: ?[*:0]const u8) c_int {
+    const input_path = absolutePathFromAbi(map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const output_path = absolutePathFromAbi(output_text_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    if (std.mem.eql(u8, output_path, input_path)) return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const input_file = std.Io.Dir.openFileAbsolute(io, input_path, .{}) catch return @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED);
+    var reader = pointerscan.PointerMapReader.init(c_allocator, io, input_file) catch |err| return @intFromEnum(statusFrom(err));
+    defer reader.deinit();
+
+    const output_file = std.Io.Dir.createFileAbsolute(io, output_path, .{ .truncate = true }) catch return @intFromEnum(LmStatus.WRITE_FAILED);
+    defer output_file.close(io);
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var output_writer = output_file.writer(io, &buffer);
+    reader.dumpText(&output_writer.interface) catch |err| return @intFromEnum(statusFrom(err));
+    output_writer.flush() catch return @intFromEnum(LmStatus.WRITE_FAILED);
     return @intFromEnum(LmStatus.OK);
 }
 

@@ -19,6 +19,7 @@
 
 import ctypes
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Generator, Optional
@@ -66,6 +67,14 @@ class Status(IntEnum):
     PARSE_FAILED = 24
     CONVERSION_FAILED = 25
     INTERNAL_ERROR = 26
+    INVALID_POINTER_MAP_DATA = 27
+    INVALID_POINTER_MAP_FORMAT = 28
+    INVALID_POINTER_SCAN_OPTIONS = 29
+    UNSUPPORTED_POINTER_MAP_VERSION = 30
+    POINTER_MODULE_INDEX_OUT_OF_RANGE = 31
+    POINTER_MAP_CREATE_FAILED = 32
+    POINTER_MAP_READ_FAILED = 33
+    POINTER_MAP_WRITE_FAILED = 34
 
 
 class ScanLevel(IntEnum):
@@ -113,6 +122,12 @@ class MatchType(IntEnum):
     MATCHDECREASEDBY = 12
 
 
+class PointerEndianness(IntEnum):
+    NATIVE = 0
+    LITTLE = 1
+    BIG = 2
+
+
 FLAG_U8 = 1 << 0
 FLAG_S8 = 1 << 1
 FLAG_U16 = 1 << 2
@@ -126,6 +141,8 @@ FLAG_F64 = 1 << 9
 
 WILDCARD_FIXED = 0xFF
 WILDCARD_ANY = 0x00
+_MAX_SIZE_T = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
+_MAX_U64 = (1 << 64) - 1
 
 
 class ValueData(ctypes.Union):
@@ -189,6 +206,19 @@ class AbiUserValue(ctypes.Structure):
         ("wildcards", ctypes.POINTER(ctypes.c_uint8)),
         ("data_len", ctypes.c_size_t),
         ("flags_bits", ctypes.c_uint16),
+    ]
+
+
+class AbiPointerScanOptions(ctypes.Structure):
+    _fields_ = [
+        ("pointer_width", ctypes.c_uint8),
+        ("max_depth", ctypes.c_uint8),
+        ("module_base_only", ctypes.c_bool),
+        ("has_max_results", ctypes.c_bool),
+        ("endianness", ctypes.c_int),
+        ("max_positive_offset", ctypes.c_size_t),
+        ("max_negative_offset", ctypes.c_size_t),
+        ("max_results", ctypes.c_uint64),
     ]
 
 
@@ -369,6 +399,17 @@ class RegionView:
         )
 
 
+@dataclass(frozen=True)
+class PointerScanOptions:
+    pointer_width: int = ctypes.sizeof(ctypes.c_size_t)
+    endianness: PointerEndianness = PointerEndianness.NATIVE
+    max_depth: int = 5
+    module_base_only: bool = True
+    max_positive_offset: int = 2048
+    max_negative_offset: int = 0
+    max_results: Optional[int] = None
+
+
 class Libmemscan:
     def __init__(self, libpath: str = "libmemscan.so"):
         self._lib = ctypes.CDLL(libpath)
@@ -402,6 +443,9 @@ class Libmemscan:
             "lm_update": [ctypes.c_void_p],
             "lm_undo_scan": [ctypes.c_void_p],
             "lm_scan": [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(AbiUserValue), ctypes.POINTER(AbiUserValue)],
+            "lm_pointer_scan": [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.POINTER(AbiPointerScanOptions), ctypes.POINTER(ctypes.c_uint64)],
+            "lm_pointer_map_compare": [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)],
+            "lm_pointer_map_dump_text": [ctypes.c_char_p, ctypes.c_char_p],
             "lm_remove_region_by_id": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_index": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_address": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
@@ -650,6 +694,102 @@ class Libmemscan:
                 ctypes.byref(raw2) if raw2 is not None else None,
             ),
             f"scan({MatchType(match_type).name})",
+        )
+
+    def _path_bytes(self, path: object) -> bytes:
+        raw_path = os.fspath(path)
+        if not raw_path:
+            raise ValueError("path must not be empty")
+
+        absolute_path = os.path.abspath(raw_path)
+        path_bytes = absolute_path if isinstance(absolute_path, bytes) else os.fsencode(absolute_path)
+        if b"\0" in path_bytes:
+            raise ValueError("path must not contain NUL bytes")
+        return path_bytes
+
+    def _make_pointer_scan_options(self, options: PointerScanOptions) -> AbiPointerScanOptions:
+        if not isinstance(options, PointerScanOptions):
+            raise TypeError("options must be a PointerScanOptions instance")
+        if type(options.pointer_width) is not int or options.pointer_width not in (4, 8):
+            raise ValueError("pointer_width must be 4 or 8")
+        if type(options.max_depth) is not int or not 1 <= options.max_depth <= 0xFF:
+            raise ValueError("max_depth must be between 1 and 255")
+        if (
+            type(options.max_positive_offset) is not int
+            or type(options.max_negative_offset) is not int
+            or options.max_positive_offset < 0
+            or options.max_negative_offset < 0
+        ):
+            raise ValueError("pointer offsets must be non-negative integers")
+        if options.max_positive_offset > _MAX_SIZE_T or options.max_negative_offset > _MAX_SIZE_T:
+            raise ValueError("pointer offsets must fit in size_t")
+        if options.max_results is not None and (
+            type(options.max_results) is not int
+            or not 0 <= options.max_results <= _MAX_U64
+        ):
+            raise ValueError("max_results must fit in u64")
+        if type(options.module_base_only) is not bool:
+            raise ValueError("module_base_only must be a bool")
+
+        if type(options.endianness) is bool:
+            raise ValueError("endianness must be a PointerEndianness value")
+        try:
+            endianness = PointerEndianness(options.endianness)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("endianness must be a PointerEndianness value") from exc
+        raw = AbiPointerScanOptions()
+        raw.pointer_width = options.pointer_width
+        raw.max_depth = options.max_depth
+        raw.module_base_only = options.module_base_only
+        raw.has_max_results = options.max_results is not None
+        raw.endianness = int(endianness)
+        raw.max_positive_offset = options.max_positive_offset
+        raw.max_negative_offset = options.max_negative_offset
+        raw.max_results = 0 if options.max_results is None else options.max_results
+        return raw
+
+    def pointer_scan(self, target_address: int, output_map_path: object, options: Optional[PointerScanOptions] = None) -> int:
+        if type(target_address) is not int or not 0 <= target_address <= _MAX_SIZE_T:
+            raise ValueError("target_address must fit in size_t")
+
+        raw_options = self._make_pointer_scan_options(options if options is not None else PointerScanOptions())
+        path = self._path_bytes(output_map_path)
+        paths_found = ctypes.c_uint64()
+        self._check(
+            self._lib.lm_pointer_scan(
+                self._scanner,
+                target_address,
+                path,
+                ctypes.byref(raw_options),
+                ctypes.byref(paths_found),
+            ),
+            "pointer_scan",
+        )
+        return int(paths_found.value)
+
+    def compare_pointer_maps(self, previous_map_path: object, current_map_path: object, output_map_path: object) -> int:
+        previous_path = self._path_bytes(previous_map_path)
+        current_path = self._path_bytes(current_map_path)
+        output_path = self._path_bytes(output_map_path)
+        paths_found = ctypes.c_uint64()
+        self._check(
+            self._lib.lm_pointer_map_compare(
+                previous_path,
+                current_path,
+                output_path,
+                ctypes.byref(paths_found),
+            ),
+            "compare_pointer_maps",
+        )
+        return int(paths_found.value)
+
+    def dump_pointer_map_text(self, map_path: object, output_text_path: object) -> None:
+        self._check(
+            self._lib.lm_pointer_map_dump_text(
+                self._path_bytes(map_path),
+                self._path_bytes(output_text_path),
+            ),
+            "dump_pointer_map_text",
         )
 
     def get_match_count(self) -> int:

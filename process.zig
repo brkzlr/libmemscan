@@ -155,6 +155,7 @@ inline fn isRegionHeapStackOrExe(region_kind: RegionKind, filename: []const u8, 
 const MapsLine = struct {
     start: usize,
     end: usize,
+    offset: usize,
     flags: RegionFlags,
     pathname: []const u8, // is a slice into the original line buffer
 };
@@ -184,10 +185,10 @@ fn parseMapsLine(line: []const u8) ?MapsLine {
         .private = perms[3] == 'p',
     };
 
-    // fields 3-5: offset, dev, inode (skip)
-    _ = it.next(); // offset
-    _ = it.next(); // dev
-    _ = it.next(); // inode
+    // fields 3-5: offset, dev, inode
+    const offset = std.fmt.parseUnsigned(usize, it.next() orelse return null, 16) catch return null;
+    _ = it.next() orelse return null; // dev
+    _ = it.next() orelse return null; // inode
 
     // field 6 (optional): pathname
     // remainder of the line after the inode field, trimmed
@@ -196,6 +197,7 @@ fn parseMapsLine(line: []const u8) ?MapsLine {
     return .{
         .start = start,
         .end = end,
+        .offset = offset,
         .flags = flags,
         .pathname = pathname,
     };
@@ -281,7 +283,6 @@ const LinuxBackend = struct {
         var load_addr: usize = 0;
         var exe_load: usize = 0;
         var is_exe: bool = false;
-        var bin_name_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         var bin_name: []const u8 = "";
         var region_id: u32 = 0;
 
@@ -292,6 +293,11 @@ const LinuxBackend = struct {
             }
 
             const parsed = parseMapsLine(line) orelse continue;
+            // File offsets let all mapped slices of the same ELF image share one load address.
+            var region_load_addr = if (parsed.pathname.len > 0 and parsed.offset <= parsed.start)
+                parsed.start - parsed.offset
+            else
+                parsed.start;
 
             if (code_regions > 0) {
                 const same_file = parsed.pathname.len > 0 and std.mem.eql(u8, parsed.pathname, bin_name);
@@ -305,6 +311,7 @@ const LinuxBackend = struct {
                     }
                 } else {
                     code_regions += 1;
+                    region_load_addr = load_addr;
                     if (is_exe) {
                         exe_regions += 1;
                     }
@@ -314,23 +321,23 @@ const LinuxBackend = struct {
             if (code_regions == 0) {
                 if (parsed.flags.exec and parsed.pathname.len > 0) {
                     code_regions = 1;
+                    load_addr = region_load_addr;
                     if (std.mem.eql(u8, parsed.pathname, exe_name)) {
                         exe_regions = 1;
-                        exe_load = parsed.start;
+                        exe_load = load_addr;
                         is_exe = true;
                     }
-                    @memcpy(bin_name_buf[0..parsed.pathname.len], parsed.pathname);
-                    bin_name = bin_name_buf[0..parsed.pathname.len];
+                    bin_name = parsed.pathname;
                 } else if (exe_regions == 1 and parsed.pathname.len > 0 and std.mem.eql(u8, parsed.pathname, exe_name)) {
                     exe_regions += 1;
                     code_regions = exe_regions;
                     load_addr = exe_load;
+                    region_load_addr = load_addr;
                     is_exe = true;
-                    @memcpy(bin_name_buf[0..parsed.pathname.len], parsed.pathname);
-                    bin_name = bin_name_buf[0..parsed.pathname.len];
+                    bin_name = parsed.pathname;
                 }
 
-                if (exe_regions < 2) load_addr = parsed.start;
+                if (exe_regions < 2) load_addr = region_load_addr;
             }
 
             prev_end = parsed.end;
@@ -357,12 +364,27 @@ const LinuxBackend = struct {
                 .size = parsed.end - parsed.start,
                 .kind = region_kind,
                 .flags = parsed.flags,
-                .load_addr = load_addr,
+                .load_addr = region_load_addr,
                 .id = region_id,
                 .filename = filename_copy,
             }) catch return ProcessError.RegionEnumFailed;
 
             region_id += 1;
+        }
+
+        // Earlier non-executable mappings of an ELF image can be seen before
+        // the executable slice that identifies the module.
+        for (regions.items) |*region| {
+            if (region.kind != .MISC or region.filename.len == 0) continue;
+
+            for (regions.items) |candidate| {
+                if (candidate.kind != .EXE and candidate.kind != .CODE) continue;
+                if (candidate.load_addr != region.load_addr) continue;
+                if (!std.mem.eql(u8, candidate.filename, region.filename)) continue;
+
+                region.kind = candidate.kind;
+                break;
+            }
         }
 
         return regions.toOwnedSlice(allocator) catch return ProcessError.RegionEnumFailed;
@@ -648,10 +670,11 @@ const MacOSBackend = struct {
 // ---------------------------------------------------------------------------
 
 test "[Linux] parseMapsLine: normal executable region" {
-    const line = "7f1234560000-7f1234561000 r-xp 00000000 08:01 99999 /usr/lib/libc.so.6";
+    const line = "7f1234560000-7f1234561000 r-xp 00003000 08:01 99999 /usr/lib/libc.so.6";
     const result = parseMapsLine(line).?;
     try std.testing.expectEqual(@as(usize, 0x7f1234560000), result.start);
     try std.testing.expectEqual(@as(usize, 0x7f1234561000), result.end);
+    try std.testing.expectEqual(@as(usize, 0x3000), result.offset);
     try std.testing.expect(result.flags.read);
     try std.testing.expect(!result.flags.write);
     try std.testing.expect(result.flags.exec);
