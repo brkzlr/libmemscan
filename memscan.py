@@ -399,7 +399,7 @@ class RegionView:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class PointerScanOptions:
     pointer_width: int = ctypes.sizeof(ctypes.c_size_t)
     endianness: PointerEndianness = PointerEndianness.NATIVE
