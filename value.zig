@@ -180,8 +180,8 @@ pub const UserValue = struct {
     uint64_value: u64 = 0,
     float32_value: f32 = 0,
     float64_value: f64 = 0,
-    bytearray_value: ?[]u8 = null,
-    wildcard_value: ?[]Wildcard = null,
+    bytearray_value: ?[]const u8 = null,
+    wildcard_value: ?[]const Wildcard = null,
     string_value: ?[]const u8 = null,
     flags: MatchFlags = .{},
 
@@ -328,35 +328,35 @@ pub const UserValue = struct {
         var result = try UserValue.parseFloat(text);
         const number = result.float64_value;
 
-        if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u8)))) {
+        if (number >= 0 and number <= std.math.maxInt(u8)) {
             result.flags.u8b = true;
             result.uint8_value = @intFromFloat(number);
         }
-        if (number >= @as(f64, @floatFromInt(std.math.minInt(i8))) and number <= @as(f64, @floatFromInt(std.math.maxInt(i8)))) {
+        if (number >= std.math.minInt(i8) and number <= std.math.maxInt(i8)) {
             result.flags.s8b = true;
             result.int8_value = @intFromFloat(number);
         }
-        if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u16)))) {
+        if (number >= 0 and number <= std.math.maxInt(u16)) {
             result.flags.u16b = true;
             result.uint16_value = @intFromFloat(number);
         }
-        if (number >= @as(f64, @floatFromInt(std.math.minInt(i16))) and number <= @as(f64, @floatFromInt(std.math.maxInt(i16)))) {
+        if (number >= std.math.minInt(i16) and number <= std.math.maxInt(i16)) {
             result.flags.s16b = true;
             result.int16_value = @intFromFloat(number);
         }
-        if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+        if (number >= 0 and number <= std.math.maxInt(u32)) {
             result.flags.u32b = true;
             result.uint32_value = @intFromFloat(number);
         }
-        if (number >= @as(f64, @floatFromInt(std.math.minInt(i32))) and number <= @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
+        if (number >= std.math.minInt(i32) and number <= std.math.maxInt(i32)) {
             result.flags.s32b = true;
             result.int32_value = @intFromFloat(number);
         }
-        if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+        if (number >= 0 and number < @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
             result.flags.u64b = true;
             result.uint64_value = @intFromFloat(number);
         }
-        if (number >= @as(f64, @floatFromInt(std.math.minInt(i64))) and number <= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+        if (number >= std.math.minInt(i64) and number < @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
             result.flags.s64b = true;
             result.int64_value = @intFromFloat(number);
         }
@@ -371,15 +371,15 @@ pub const UserValue = struct {
 
 test "parseInt: preserves matching signed and unsigned ranges" {
     const value = try UserValue.parseInt("255");
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u8b = true, .u16b = true, .u32b = true, .u64b = true, .s16b = true, .s32b = true, .s64b = true }).bits()), value.flags.bits());
+    try std.testing.expectEqual((MatchFlags{ .u8b = true, .u16b = true, .u32b = true, .u64b = true, .s16b = true, .s32b = true, .s64b = true }).bits(), value.flags.bits());
     try std.testing.expect(!value.flags.s8b);
-    try std.testing.expectEqual(@as(u8, 255), value.uint8_value);
-    try std.testing.expectEqual(@as(u16, 255), value.uint16_value);
-    try std.testing.expectEqual(@as(u32, 255), value.uint32_value);
-    try std.testing.expectEqual(@as(u64, 255), value.uint64_value);
-    try std.testing.expectEqual(@as(i16, 255), value.int16_value);
-    try std.testing.expectEqual(@as(i32, 255), value.int32_value);
-    try std.testing.expectEqual(@as(i64, 255), value.int64_value);
+    try std.testing.expectEqual(255, value.uint8_value);
+    try std.testing.expectEqual(255, value.uint16_value);
+    try std.testing.expectEqual(255, value.uint32_value);
+    try std.testing.expectEqual(255, value.uint64_value);
+    try std.testing.expectEqual(255, value.int16_value);
+    try std.testing.expectEqual(255, value.int32_value);
+    try std.testing.expectEqual(255, value.int64_value);
 }
 
 test "parseInt: does not enable float flags" {
@@ -390,20 +390,20 @@ test "parseInt: does not enable float flags" {
 
 test "parseNumber: from integer also enables float flags" {
     const value = try UserValue.parseNumber("42");
-    try std.testing.expectEqual(@as(u16, MatchFlags.all.bits()), value.flags.bits());
-    try std.testing.expectEqual(@as(u8, 42), value.uint8_value);
-    try std.testing.expectEqual(@as(i8, 42), value.int8_value);
-    try std.testing.expectEqual(@as(f32, 42), value.float32_value);
-    try std.testing.expectEqual(@as(f64, 42), value.float64_value);
+    try std.testing.expectEqual(MatchFlags.all.bits(), value.flags.bits());
+    try std.testing.expectEqual(42, value.uint8_value);
+    try std.testing.expectEqual(42, value.int8_value);
+    try std.testing.expectEqual(42, value.float32_value);
+    try std.testing.expectEqual(42, value.float64_value);
 }
 
 test "parseNumber: from float backfills integer candidates" {
     const value = try UserValue.parseNumber("12.75");
-    try std.testing.expectEqual(@as(u16, MatchFlags.all.bits()), value.flags.bits());
-    try std.testing.expectEqual(@as(u8, 12), value.uint8_value);
-    try std.testing.expectEqual(@as(i8, 12), value.int8_value);
-    try std.testing.expectEqual(@as(f32, 12.75), value.float32_value);
-    try std.testing.expectEqual(@as(f64, 12.75), value.float64_value);
+    try std.testing.expectEqual(MatchFlags.all.bits(), value.flags.bits());
+    try std.testing.expectEqual(12, value.uint8_value);
+    try std.testing.expectEqual(12, value.int8_value);
+    try std.testing.expectEqual(12.75, value.float32_value);
+    try std.testing.expectEqual(12.75, value.float64_value);
 }
 
 test "parseByteArray: allocates bytes and wildcards" {
@@ -430,6 +430,6 @@ test "parseByteArrayText: tokenizes whitespace-delimited input" {
 test "Value: initialization from user value prefers floats over ints for matching widths" {
     const user = try UserValue.parseNumber("3.5");
     const value = try Value.initFromUserValue(user, .{ .f32b = true, .u32b = true, .s32b = true });
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .f32b = true, .u32b = true, .s32b = true }).bits()), value.flags.bits());
-    try std.testing.expectEqual(@as(f32, 3.5), value.data.float32_value);
+    try std.testing.expectEqual((MatchFlags{ .f32b = true, .u32b = true, .s32b = true }).bits(), value.flags.bits());
+    try std.testing.expectEqual(3.5, value.data.float32_value);
 }

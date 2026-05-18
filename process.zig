@@ -224,7 +224,7 @@ const LinuxBackend = struct {
         var nread: usize = 0;
 
         while (nread < buf.len) {
-            const ret = self.mem_fd.readPositional(io, &.{buf[nread..]}, @intCast(addr + nread)) catch {
+            const ret = self.mem_fd.readPositional(io, &.{buf[nread..]}, addr + nread) catch {
                 return if (nread == 0) ProcessError.ReadFailed else nread;
             };
 
@@ -238,7 +238,7 @@ const LinuxBackend = struct {
     fn write(self: *LinuxBackend, io: std.Io, addr: usize, data: []const u8) ProcessError!void {
         var offset: usize = 0;
         while (offset < data.len) {
-            const n = self.mem_fd.writePositional(io, &.{data[offset..]}, @intCast(addr + offset)) catch return ProcessError.WriteFailed;
+            const n = self.mem_fd.writePositional(io, &.{data[offset..]}, addr + offset) catch return ProcessError.WriteFailed;
             if (n == 0) return ProcessError.WriteFailed;
             offset += n;
         }
@@ -502,9 +502,9 @@ const MacOSBackend = struct {
         var exe_name: []const u8 = "";
         var exe_stat: std.c.Stat = undefined;
         var exe_has_identity = false;
-        const exe_name_raw_len = proc_pidpath(@intCast(pid), &exe_name_buf, @intCast(exe_name_buf.len));
+        const exe_name_raw_len = proc_pidpath(pid, &exe_name_buf, exe_name_buf.len);
         if (exe_name_raw_len > 0) {
-            const exe_name_len = @min(@as(usize, @intCast(exe_name_raw_len)), exe_name_buf.len);
+            const exe_name_len: usize = @intCast(@min(exe_name_raw_len, exe_name_buf.len));
             const exe_name_path = exe_name_buf[0..exe_name_len];
             exe_name = exe_name_path[0 .. std.mem.indexOfScalar(u8, exe_name_path, 0) orelse exe_name_path.len];
             if (exe_name.len < exe_name_buf.len) {
@@ -555,9 +555,9 @@ const MacOSBackend = struct {
             // Grab the filename that backs up this region
             // If empty (""), might be anonymous region which is the equivalent of Linux BSS.
             var filename: []const u8 = "";
-            const filename_raw_len = proc_regionfilename(@intCast(pid), @intCast(address), &filename_buf, @intCast(filename_buf.len));
+            const filename_raw_len = proc_regionfilename(pid, address, &filename_buf, filename_buf.len);
             if (filename_raw_len > 0) {
-                const filename_len = @min(@as(usize, @intCast(filename_raw_len)), filename_buf.len);
+                const filename_len: usize = @intCast(@min(filename_raw_len, filename_buf.len));
                 const filename_path = filename_buf[0..filename_len];
                 filename = filename_path[0 .. std.mem.indexOfScalar(u8, filename_path, 0) orelse filename_path.len];
             }
@@ -672,9 +672,9 @@ const MacOSBackend = struct {
 test "[Linux] parseMapsLine: normal executable region" {
     const line = "7f1234560000-7f1234561000 r-xp 00003000 08:01 99999 /usr/lib/libc.so.6";
     const result = parseMapsLine(line).?;
-    try std.testing.expectEqual(@as(usize, 0x7f1234560000), result.start);
-    try std.testing.expectEqual(@as(usize, 0x7f1234561000), result.end);
-    try std.testing.expectEqual(@as(usize, 0x3000), result.offset);
+    try std.testing.expectEqual(0x7f1234560000, result.start);
+    try std.testing.expectEqual(0x7f1234561000, result.end);
+    try std.testing.expectEqual(0x3000, result.offset);
     try std.testing.expect(result.flags.read);
     try std.testing.expect(!result.flags.write);
     try std.testing.expect(result.flags.exec);
@@ -698,7 +698,7 @@ test "[Linux] parseMapsLine: [heap] region" {
 }
 
 test "[Linux] parseMapsLine: malformed line returns null" {
-    try std.testing.expectEqual(@as(?MapsLine, null), parseMapsLine("not a maps line"));
+    try std.testing.expectEqual(null, parseMapsLine("not a maps line"));
 }
 
 test "isUsefulRegion: heap is included in heap_stack_exe" {

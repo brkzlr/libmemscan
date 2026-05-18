@@ -382,10 +382,10 @@ pub const MatchesArray = struct {
     fn dataToValueAux(self: *const MatchesArray, swath_offset: usize, index: usize, swath_length: usize) Value {
         var result = Value{
             .data = .{ .uint64_value = 0 },
-            .flags = @bitCast(@as(u16, 0xffff)),
+            .flags = .{},
         };
 
-        const max_bytes = @min(swath_length - index, @as(usize, 8));
+        const max_bytes = @min(swath_length - index, 8);
 
         var flags_bits: u16 = 0xffff;
         if (max_bytes < 8) flags_bits &= ~flags64Mask();
@@ -486,15 +486,15 @@ test "append: keeps contiguous and near-gap bytes in one swath" {
     try matches.append(0x1001, 0xbb, .{ .u8b = true });
     try matches.append(0x1003, 0xcc, .{ .u8b = true });
 
-    try std.testing.expectEqual(@as(usize, 3), matches.matchCount());
-    try std.testing.expectEqual(@as(usize, 4), matches.swathAtConst(0).number_of_bytes);
-    try std.testing.expectEqual(@as(usize, 0x1000), matches.swathAtConst(0).first_byte_in_child);
-    try std.testing.expectEqual(@as(u8, 0xaa), matches.entryAtConst(0, 0).old_value);
-    try std.testing.expectEqual(@as(u8, 0xbb), matches.entryAtConst(0, 1).old_value);
-    try std.testing.expectEqual(@as(u16, 0), matches.entryAtConst(0, 2).match_info_bits);
-    try std.testing.expectEqual(@as(u8, 0), matches.entryAtConst(0, 2).old_value);
-    try std.testing.expectEqual(@as(u8, 0xcc), matches.entryAtConst(0, 3).old_value);
-    try std.testing.expectEqual(@as(usize, 0), matches.swathAtConst(matches.localAddressBeyondLastElement(0)).first_byte_in_child);
+    try std.testing.expectEqual(3, matches.matchCount());
+    try std.testing.expectEqual(4, matches.swathAtConst(0).number_of_bytes);
+    try std.testing.expectEqual(0x1000, matches.swathAtConst(0).first_byte_in_child);
+    try std.testing.expectEqual(0xaa, matches.entryAtConst(0, 0).old_value);
+    try std.testing.expectEqual(0xbb, matches.entryAtConst(0, 1).old_value);
+    try std.testing.expectEqual(0, matches.entryAtConst(0, 2).match_info_bits);
+    try std.testing.expectEqual(0, matches.entryAtConst(0, 2).old_value);
+    try std.testing.expectEqual(0xcc, matches.entryAtConst(0, 3).old_value);
+    try std.testing.expectEqual(0, matches.swathAtConst(matches.localAddressBeyondLastElement(0)).first_byte_in_child);
 }
 
 test "append: starts a new swath when padding cost matches header cost" {
@@ -505,15 +505,15 @@ test "append: starts a new swath when padding cost matches header cost" {
     try matches.append(0x2005, 0x22, .{ .u8b = true });
 
     const first_swath = matches.swathAtConst(0);
-    try std.testing.expectEqual(@as(usize, 0x2000), first_swath.first_byte_in_child);
-    try std.testing.expectEqual(@as(usize, 1), first_swath.number_of_bytes);
+    try std.testing.expectEqual(0x2000, first_swath.first_byte_in_child);
+    try std.testing.expectEqual(1, first_swath.number_of_bytes);
 
     const second_swath_offset = matches.localAddressBeyondLastElement(0);
     const second_swath = matches.swathAtConst(second_swath_offset);
-    try std.testing.expectEqual(@as(usize, 0x2005), second_swath.first_byte_in_child);
-    try std.testing.expectEqual(@as(usize, 1), second_swath.number_of_bytes);
-    try std.testing.expectEqual(@as(usize, 2), matches.matchCount());
-    try std.testing.expectEqual(@as(usize, 0), matches.swathAtConst(matches.localAddressBeyondLastElement(second_swath_offset)).first_byte_in_child);
+    try std.testing.expectEqual(0x2005, second_swath.first_byte_in_child);
+    try std.testing.expectEqual(1, second_swath.number_of_bytes);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0, matches.swathAtConst(matches.localAddressBeyondLastElement(second_swath_offset)).first_byte_in_child);
 }
 
 test "nthMatch: skips padded entries" {
@@ -526,13 +526,13 @@ test "nthMatch: skips padded entries" {
     const first = matches.nthMatch(0).?;
     const second = matches.nthMatch(1).?;
 
-    try std.testing.expectEqual(@as(usize, 0x3000), first.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x3002), second.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(u16, 0), matches.entryAtConst(0, 1).match_info_bits);
+    try std.testing.expectEqual(0x3000, first.remoteAddress(&matches));
+    try std.testing.expectEqual(0x3002, second.remoteAddress(&matches));
+    try std.testing.expectEqual(0, matches.entryAtConst(0, 1).match_info_bits);
     try std.testing.expect(matches.nthMatch(2) == null);
-    try std.testing.expectEqual(@as(usize, 0), matches.findMatchIndexByAddress(0x3000).?);
-    try std.testing.expectEqual(@as(?usize, 1), matches.findMatchIndexByAddress(0x3002));
-    try std.testing.expectEqual(@as(?usize, null), matches.findMatchIndexByAddress(0x3001));
+    try std.testing.expectEqual(0, matches.findMatchIndexByAddress(0x3000).?);
+    try std.testing.expectEqual(1, matches.findMatchIndexByAddress(0x3002));
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x3001));
 }
 
 test "deleteInAddressRange: compacts in place and preserves remaining matches" {
@@ -547,16 +547,16 @@ test "deleteInAddressRange: compacts in place and preserves remaining matches" {
 
     try matches.deleteInAddressRange(0x4001, 0x4006);
 
-    try std.testing.expectEqual(@as(usize, 2), matches.matchCount());
+    try std.testing.expectEqual(2, matches.matchCount());
     const first = matches.nthMatch(0).?;
     const second = matches.nthMatch(1).?;
-    try std.testing.expectEqual(@as(usize, 0x4000), first.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x4006), second.remoteAddress(&matches));
+    try std.testing.expectEqual(0x4000, first.remoteAddress(&matches));
+    try std.testing.expectEqual(0x4006, second.remoteAddress(&matches));
     try std.testing.expect(matches.nthMatch(2) == null);
-    try std.testing.expectEqual(@as(u8, 0x01), first.value(&matches).data.uint8_value);
-    try std.testing.expectEqual(@as(u8, 0x04), second.value(&matches).data.uint8_value);
-    try std.testing.expectEqual(@as(?usize, null), matches.findMatchIndexByAddress(0x4001));
-    try std.testing.expectEqual(@as(?usize, null), matches.findMatchIndexByAddress(0x4005));
+    try std.testing.expectEqual(0x01, first.value(&matches).data.uint8_value);
+    try std.testing.expectEqual(0x04, second.value(&matches).data.uint8_value);
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x4001));
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x4005));
 }
 
 test "removeMatch: preserves dense match sets after deleting one match" {
@@ -574,13 +574,13 @@ test "removeMatch: preserves dense match sets after deleting one match" {
     const location = matches.nthMatch(400).?;
     matches.removeMatch(location);
 
-    try std.testing.expectEqual(@as(usize, 1023), matches.matchCount());
-    try std.testing.expectEqual(@as(usize, 0x5000), matches.nthMatch(0).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x5000 + 4 * 399), matches.nthMatch(399).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x5000 + 4 * 401), matches.nthMatch(400).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x5000 + 4 * 1023), matches.nthMatch(1022).?.remoteAddress(&matches));
+    try std.testing.expectEqual(1023, matches.matchCount());
+    try std.testing.expectEqual(0x5000, matches.nthMatch(0).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0x5000 + 4 * 399, matches.nthMatch(399).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0x5000 + 4 * 401, matches.nthMatch(400).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0x5000 + 4 * 1023, matches.nthMatch(1022).?.remoteAddress(&matches));
     try std.testing.expect(matches.nthMatch(1023) == null);
-    try std.testing.expectEqual(@as(?usize, null), matches.findMatchIndexByAddress(0x5000 + 4 * 400));
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x5000 + 4 * 400));
 }
 
 test "dataToValue: truncates width flags by remaining bytes" {
@@ -592,10 +592,10 @@ test "dataToValue: truncates width flags by remaining bytes" {
     try matches.append(0x5002, 0x34, .{});
 
     const value = matches.dataToValue(0, 0);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u8b = true, .s8b = true, .u16b = true, .s16b = true }).bits()), value.flags.bits());
-    try std.testing.expectEqual(@as(u8, 0x78), value.data.bytes[0]);
-    try std.testing.expectEqual(@as(u8, 0x56), value.data.bytes[1]);
-    try std.testing.expectEqual(@as(u8, 0x34), value.data.bytes[2]);
+    try std.testing.expectEqual((MatchFlags{ .u8b = true, .s8b = true, .u16b = true, .s16b = true }).bits(), value.flags.bits());
+    try std.testing.expectEqual(0x78, value.data.bytes[0]);
+    try std.testing.expectEqual(0x56, value.data.bytes[1]);
+    try std.testing.expectEqual(0x34, value.data.bytes[2]);
 }
 
 test "dataToValue: reconstructs full 64-bit value from match plus trailing bytes" {
@@ -612,8 +612,8 @@ test "dataToValue: reconstructs full 64-bit value from match plus trailing bytes
     try matches.append(0x7007, 0x5a, .{});
 
     const value = matches.dataToValue(0, 0);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u64b = true }).bits()), value.flags.bits());
-    try std.testing.expectEqual(@as(u64, 0x5A17D3C49E2B6F10), value.data.uint64_value);
+    try std.testing.expectEqual((MatchFlags{ .u64b = true }).bits(), value.flags.bits());
+    try std.testing.expectEqual(0x5A17D3C49E2B6F10, value.data.uint64_value);
 }
 
 test "dataToBytes: returns raw stored bytes" {

@@ -247,7 +247,7 @@ fn statusFrom(err: anyerror) LmStatus {
     };
 }
 
-fn wildcardSlice(raw: [*]const u8, len: usize) ![]Wildcard {
+fn wildcardSlice(raw: [*]const u8, len: usize) ![]const Wildcard {
     const raw_slice = raw[0..len];
     for (raw_slice) |item| {
         switch (item) {
@@ -257,7 +257,7 @@ fn wildcardSlice(raw: [*]const u8, len: usize) ![]Wildcard {
     }
 
     const typed_ptr: [*]const Wildcard = @ptrCast(raw);
-    return @constCast(typed_ptr[0..len]);
+    return typed_ptr[0..len];
 }
 
 fn userValueFromAbi(raw: LmUserValue, data_type: ScanDataType, for_write: bool) !UserValue {
@@ -278,7 +278,7 @@ fn userValueFromAbi(raw: LmUserValue, data_type: ScanDataType, for_write: bool) 
     switch (data_type) {
         .BYTEARRAY => {
             const data_ptr = raw.data orelse return error.InvalidArgument;
-            user.bytearray_value = @constCast(data_ptr[0..raw.data_len]);
+            user.bytearray_value = data_ptr[0..raw.data_len];
             if (!for_write) {
                 const wildcards_ptr = raw.wildcards orelse return error.InvalidArgument;
                 user.wildcard_value = try wildcardSlice(wildcards_ptr, raw.data_len);

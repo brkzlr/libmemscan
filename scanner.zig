@@ -133,11 +133,11 @@ const UndoFileHeader = extern struct {
 
     fn init(scanner: *const Scanner, matches: *const MatchesArray) UndoFileHeader {
         return .{
-            .num_matches = @intCast(scanner.num_matches),
-            .used_len = @intCast(matches.used_len),
-            .max_needed_bytes = @intCast(matches.max_needed_bytes),
-            .tail_swath_offset = @intCast(matches.tail_swath_offset),
-            .match_count = @intCast(matches.match_count),
+            .num_matches = scanner.num_matches,
+            .used_len = matches.used_len,
+            .max_needed_bytes = matches.max_needed_bytes,
+            .tail_swath_offset = matches.tail_swath_offset,
+            .match_count = matches.match_count,
             .alignment = scanner.options.alignment,
             .scan_data_type = @intFromEnum(scanner.options.scan_data_type),
             .scan_level = @intFromEnum(scanner.options.scan_level),
@@ -729,7 +729,7 @@ pub const Scanner = struct {
             if (stored.isMatch()) {
                 const old_length = storedLengthForExistingMatch(prepared.data_type, stored.raw_match_info_bits);
                 if (old_length > 0) {
-                    const memory = cache.peek(handle, stored.address, @intCast(old_length)) catch {
+                    const memory = cache.peek(handle, stored.address, old_length) catch {
                         required_extra_bytes = 0;
                         processed += 1;
                         self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
@@ -742,7 +742,7 @@ pub const Scanner = struct {
                         try appendScanResult(&new_matches, stored.address, memory[0], result.save, &self.num_matches);
                         required_extra_bytes = result.matched_len - 1;
                     } else if (required_extra_bytes > 0) {
-                        try new_matches.append(stored.address, memory[0], @bitCast(@as(u16, 0)));
+                        try new_matches.append(stored.address, memory[0], .{});
                         required_extra_bytes -= 1;
                     }
                 }
@@ -753,7 +753,7 @@ pub const Scanner = struct {
                     self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
                     continue;
                 };
-                try new_matches.append(stored.address, memory[0], @bitCast(@as(u16, 0)));
+                try new_matches.append(stored.address, memory[0], .{});
                 required_extra_bytes -= 1;
             }
 
@@ -881,7 +881,7 @@ const MemoryCache = struct {
     size: usize = 0,
     base: ?usize = null,
 
-    fn peek(self: *MemoryCache, handle: *ProcessHandle, addr: usize, length: u16) ScannerError![]const u8 {
+    fn peek(self: *MemoryCache, handle: *ProcessHandle, addr: usize, length: usize) ScannerError![]const u8 {
         const request_end = addr + length;
 
         if (self.base) |base| {
@@ -949,7 +949,7 @@ fn scanChunkIntoMatches(
             try appendScanResult(matches, absolute_address, chunk[offset], result.save, num_matches);
             required_extra_bytes.* = result.matched_len - 1;
         } else if (required_extra_bytes.* > 0) {
-            try matches.append(absolute_address, chunk[offset], @bitCast(@as(u16, 0)));
+            try matches.append(absolute_address, chunk[offset], .{});
             required_extra_bytes.* -= 1;
         }
     }
@@ -1141,8 +1141,7 @@ fn calculateMaxMatchStorage(regions: []const Region) usize {
 
 fn regionIdIncluded(region_id: u32, region_ids: []const usize) bool {
     for (region_ids) |candidate| {
-        if (candidate > std.math.maxInt(u32)) continue;
-        if (region_id == @as(u32, @intCast(candidate))) return true;
+        if (region_id == candidate) return true;
     }
     return false;
 }
@@ -1157,14 +1156,14 @@ test "Init: starts detached with defaults" {
 
     try std.testing.expect(scanner.process_handle == null);
     try std.testing.expect(scanner.target_pid == null);
-    try std.testing.expectEqual(@as(usize, 0), scanner.regionCount());
-    try std.testing.expectEqual(@as(usize, 0), scanner.matchCount());
+    try std.testing.expectEqual(0, scanner.regionCount());
+    try std.testing.expectEqual(0, scanner.matchCount());
     try std.testing.expect(!scanner.hasMatches());
     try std.testing.expect(!scanner.undo_available);
     try std.testing.expect(scanner.fresh_session);
     try std.testing.expect(!scanner.stop_flag);
-    try std.testing.expectEqual(@as(f64, 0), scanner.scan_progress);
-    try std.testing.expectEqual(@as(u16, 1), scanner.options.alignment);
+    try std.testing.expectEqual(0, scanner.scan_progress);
+    try std.testing.expectEqual(1, scanner.options.alignment);
     try std.testing.expectEqual(ScanDataType.ANYINTEGER, scanner.options.scan_data_type);
     try std.testing.expectEqual(ScanLevel.HEAP_STACK_EXE_BSS, scanner.options.scan_level);
     try std.testing.expect(!scanner.options.reverse_endianness);
@@ -1231,8 +1230,8 @@ test "scanPointers: scans process memory and writes direct and nested pointer pa
         .max_depth = 2,
         .max_positive_offset = 0x20,
     });
-    try std.testing.expectEqual(@as(u64, 2), paths_found);
-    try std.testing.expectEqual(@as(f64, 1), scanner.scan_progress);
+    try std.testing.expectEqual(2, paths_found);
+    try std.testing.expectEqual(1, scanner.scan_progress);
 
     const read_file = try std.Io.Dir.openFileAbsolute(io, map_path, .{});
     var reader = try pointerscan.PointerMapReader.init(allocator, io, read_file);
@@ -1254,18 +1253,18 @@ test "ensureMatchStorage: allocates lazily" {
     defer scanner.deinit();
 
     const matches = try scanner.ensureMatchStorage(256);
-    try std.testing.expectEqual(@as(usize, 0), matches.matchCount());
+    try std.testing.expectEqual(0, matches.matchCount());
     try std.testing.expect(scanner.matches != null);
     try std.testing.expect(matches.storage.len >= @sizeOf(targetmem.SwathHeader));
     try std.testing.expect(matches.storage.len <= 256);
-    try std.testing.expectEqual(@as(usize, 256), matches.max_needed_bytes);
+    try std.testing.expectEqual(256, matches.max_needed_bytes);
 
     const storage_ptr = scanner.matches.?.storage.ptr;
     const storage_len = scanner.matches.?.storage.len;
     const reused = try scanner.ensureMatchStorage(512);
     try std.testing.expectEqual(storage_ptr, reused.storage.ptr);
     try std.testing.expectEqual(storage_len, reused.storage.len);
-    try std.testing.expectEqual(@as(usize, 256), reused.max_needed_bytes);
+    try std.testing.expectEqual(256, reused.max_needed_bytes);
 }
 
 test "setters update scanner options" {
@@ -1298,14 +1297,14 @@ test "match helpers expose stored match ergonomically" {
     scanner.num_matches = matches.matchCount();
 
     const first = try scanner.matchAt(0);
-    try std.testing.expectEqual(@as(usize, 0), first.index);
-    try std.testing.expectEqual(@as(usize, 0x4000), first.address);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u32b = true, .s32b = true }).bits()), first.raw_match_info_bits);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u32b = true, .s32b = true }).bits()), first.stored_value.flags.bits());
-    try std.testing.expectEqual(@as(u32, 0x12345678), first.stored_value.data.uint32_value);
-    try std.testing.expectEqual(@as(usize, 0), scanner.findMatchIndexByAddress(0x4000).?);
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x4001));
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
+    try std.testing.expectEqual(0, first.index);
+    try std.testing.expectEqual(0x4000, first.address);
+    try std.testing.expectEqual((MatchFlags{ .u32b = true, .s32b = true }).bits(), first.raw_match_info_bits);
+    try std.testing.expectEqual((MatchFlags{ .u32b = true, .s32b = true }).bits(), first.stored_value.flags.bits());
+    try std.testing.expectEqual(0x12345678, first.stored_value.data.uint32_value);
+    try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x4000).?);
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x4001));
+    try std.testing.expectEqual(1, scanner.matchCount());
     try std.testing.expect(scanner.hasMatches());
     try std.testing.expectError(ScannerError.MatchIndexOutOfRange, scanner.matchAt(1));
 }
@@ -1362,9 +1361,9 @@ test "clearUndoHistory: clears temp-file backed undo state" {
 
     scanner.clearUndoHistory();
     try std.testing.expect(!scanner.undo_available);
-    try std.testing.expectEqual(@as(u64, 0), try undo_file.length(scanner.io));
+    try std.testing.expectEqual(0, try undo_file.length(scanner.io));
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try undo_file.readPositionalAll(scanner.io, &byte, 0));
+    try std.testing.expectEqual(0, try undo_file.readPositionalAll(scanner.io, &byte, 0));
 }
 
 test "undoLastScan: restores previous match list and options" {
@@ -1402,16 +1401,16 @@ test "undoLastScan: restores previous match list and options" {
     try scanner.undoLastScan();
 
     try std.testing.expect(!scanner.undo_available);
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
-    try std.testing.expectEqual(@as(u16, 4), scanner.options.alignment);
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(4, scanner.options.alignment);
     try std.testing.expectEqual(ScanDataType.INTEGER8, scanner.options.scan_data_type);
     try std.testing.expectEqual(ScanLevel.ALL_RW, scanner.options.scan_level);
     try std.testing.expect(scanner.options.reverse_endianness);
-    try std.testing.expectEqual(@as(f64, 1), scanner.scan_progress);
+    try std.testing.expectEqual(1, scanner.scan_progress);
 
     const restored = try scanner.matchAt(0);
-    try std.testing.expectEqual(@as(usize, 0x7100), restored.address);
-    try std.testing.expectEqual(@as(u8, 0x11), restored.stored_value.data.uint8_value);
+    try std.testing.expectEqual(0x7100, restored.address);
+    try std.testing.expectEqual(0x11, restored.stored_value.data.uint8_value);
 }
 
 test "snapshot: requires a fresh reset state" {
@@ -1434,8 +1433,8 @@ test "snapshot: requires a fresh reset state" {
     try std.testing.expect(scanner.fresh_session);
     try std.testing.expect(!scanner.undo_available);
     try std.testing.expect(!scanner.hasMatches());
-    try std.testing.expectEqual(@as(usize, 0), scanner.matchCount());
-    try std.testing.expectEqual(@as(f64, 0), scanner.scan_progress);
+    try std.testing.expectEqual(0, scanner.matchCount());
+    try std.testing.expectEqual(0, scanner.scan_progress);
     try std.testing.expect(!scanner.stop_flag);
 }
 
@@ -1474,12 +1473,12 @@ test "removeRegionById: prunes affected matches and shrinks region list" {
 
     const removed = try scanner.removeRegionById(1);
     try std.testing.expect(removed);
-    try std.testing.expectEqual(@as(usize, 1), scanner.regionCount());
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
-    try std.testing.expectEqual(@as(u32, 2), scanner.regions[0].id);
-    try std.testing.expectEqual(@as(usize, 0x2000), (try scanner.matchAt(0)).address);
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x1000));
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x1008));
+    try std.testing.expectEqual(1, scanner.regionCount());
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(2, scanner.regions[0].id);
+    try std.testing.expectEqual(0x2000, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1008));
 }
 
 fn expectStoredByteRangeCleared(matches: *const MatchesArray, start_address: usize, len: usize) !void {
@@ -1489,8 +1488,8 @@ fn expectStoredByteRangeCleared(matches: *const MatchesArray, start_address: usi
         var iter = matches.storedByteIterator();
         while (iter.next()) |stored| {
             if (stored.address != address) continue;
-            try std.testing.expectEqual(@as(u8, 0), stored.old_value);
-            try std.testing.expectEqual(@as(u16, 0), stored.raw_match_info_bits);
+            try std.testing.expectEqual(0, stored.old_value);
+            try std.testing.expectEqual(0, stored.raw_match_info_bits);
             break;
         } else {
             return error.TestUnexpectedResult;
@@ -1516,10 +1515,10 @@ test "removeMatchByIndex: removes full stored match record" {
 
     const removed = try scanner.removeMatchByIndex(0);
     try std.testing.expect(removed);
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x1000));
-    try std.testing.expectEqual(@as(?usize, 0), scanner.findMatchIndexByAddress(0x2000));
-    try std.testing.expectEqual(@as(usize, 0x2000), (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
+    try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
+    try std.testing.expectEqual(0x2000, (try scanner.matchAt(0)).address);
     try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
 }
 
@@ -1543,15 +1542,15 @@ test "removeMatchByIndex: uses stored match span instead of current scan data ty
 
     const removed_numeric = try scanner.removeMatchByIndex(0);
     try std.testing.expect(removed_numeric);
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x1000));
-    try std.testing.expectEqual(@as(?usize, 0), scanner.findMatchIndexByAddress(0x2000));
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
+    try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
     try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
 
     scanner.options.scan_data_type = .INTEGER64;
     const removed_variable = try scanner.removeMatchByIndex(0);
     try std.testing.expect(removed_variable);
-    try std.testing.expectEqual(@as(usize, 0), scanner.matchCount());
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x2000));
+    try std.testing.expectEqual(0, scanner.matchCount());
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x2000));
     try std.testing.expect(!scanner.hasMatches());
     try expectStoredByteRangeCleared(&scanner.matches.?, 0x2000, 3);
 }
@@ -1574,10 +1573,10 @@ test "removeMatchByAddress: removes full stored match record" {
 
     const removed = try scanner.removeMatchByAddress(0x1000);
     try std.testing.expect(removed);
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x1000));
-    try std.testing.expectEqual(@as(?usize, 0), scanner.findMatchIndexByAddress(0x2000));
-    try std.testing.expectEqual(@as(usize, 0x2000), (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
+    try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
+    try std.testing.expectEqual(0x2000, (try scanner.matchAt(0)).address);
     try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
 }
 
@@ -1599,9 +1598,9 @@ test "removeMatchByIndex: removes full variable-length stored match record" {
 
     const removed = try scanner.removeMatchByIndex(0);
     try std.testing.expect(removed);
-    try std.testing.expectEqual(@as(usize, 1), scanner.matchCount());
-    try std.testing.expectEqual(@as(?usize, null), scanner.findMatchIndexByAddress(0x3000));
-    try std.testing.expectEqual(@as(?usize, 0), scanner.findMatchIndexByAddress(0x4000));
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x3000));
+    try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x4000));
     var buf: [2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xee }, try scanner.storedMatchBytes(0, &buf));
     try expectStoredByteRangeCleared(&scanner.matches.?, 0x3000, 3);
@@ -1624,8 +1623,8 @@ test "removeRegionById: is a no-op for missing id" {
 
     const removed = try scanner.removeRegionById(9);
     try std.testing.expect(!removed);
-    try std.testing.expectEqual(@as(usize, 1), scanner.regionCount());
-    try std.testing.expectEqual(@as(u32, 1), scanner.regions[0].id);
+    try std.testing.expectEqual(1, scanner.regionCount());
+    try std.testing.expectEqual(1, scanner.regions[0].id);
     try std.testing.expectEqualStrings("[heap]", scanner.regions[0].filename);
 }
 
@@ -1644,10 +1643,10 @@ test "removeRegionsByIdSet: is a no-op for empty ids and missing ids" {
         .filename = try std.testing.allocator.dupe(u8, "[heap]"),
     };
 
-    try std.testing.expectEqual(@as(usize, 0), try scanner.removeRegionsByIdSet(&.{}));
-    try std.testing.expectEqual(@as(usize, 1), scanner.regionCount());
-    try std.testing.expectEqual(@as(usize, 0), try scanner.removeRegionsByIdSet(&.{9}));
-    try std.testing.expectEqual(@as(usize, 1), scanner.regionCount());
+    try std.testing.expectEqual(0, try scanner.removeRegionsByIdSet(&.{}));
+    try std.testing.expectEqual(1, scanner.regionCount());
+    try std.testing.expectEqual(0, try scanner.removeRegionsByIdSet(&.{9}));
+    try std.testing.expectEqual(1, scanner.regionCount());
 }
 
 test "initialScanChunkDecision: chooses scan limit and region stop from read shape" {
@@ -1737,12 +1736,12 @@ test "scanChunkIntoMatches: records numeric matches and trailing bytes" {
     try scanChunkIntoMatches(&matches, prepared, &.{user}, 0x1000, &chunk, chunk.len, 1, &required_extra, &num_matches);
     try matches.finalize();
 
-    try std.testing.expectEqual(@as(usize, 2), num_matches);
-    try std.testing.expectEqual(@as(usize, 2), matches.matchCount());
-    try std.testing.expectEqual(@as(usize, 0x1000), matches.nthMatch(0).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(usize, 0x1004), matches.nthMatch(1).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(u16, 0), matches.rawMatchInfoBits(0, 1));
-    try std.testing.expectEqual(@as(usize, 0), required_extra);
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0x1000, matches.nthMatch(0).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0x1004, matches.nthMatch(1).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0, matches.rawMatchInfoBits(0, 1));
+    try std.testing.expectEqual(0, required_extra);
     var stored: [2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0 }, matches.dataToBytes(0, 0, 2, &stored));
 }
@@ -1773,11 +1772,11 @@ test "scanChunkIntoMatches: honors alignment gating" {
     try scanChunkIntoMatches(&matches, prepared, &.{user}, 0x2000, &chunk, chunk.len, 2, &required_extra, &num_matches);
     try matches.finalize();
 
-    try std.testing.expectEqual(@as(usize, 1), num_matches);
-    try std.testing.expectEqual(@as(usize, 1), matches.matchCount());
-    try std.testing.expectEqual(@as(usize, 0x2004), matches.nthMatch(0).?.remoteAddress(&matches));
-    try std.testing.expectEqual(@as(?usize, null), matches.findMatchIndexByAddress(0x2001));
-    try std.testing.expectEqual(@as(usize, 0), required_extra);
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0x2004, matches.nthMatch(0).?.remoteAddress(&matches));
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x2001));
+    try std.testing.expectEqual(0, required_extra);
 }
 
 test "serializeWriteValue: encodes little-endian integer32" {
@@ -1806,8 +1805,8 @@ test "serializeWriteValue: rejects ambiguous anynumber writes" {
 test "serializeWriteValue: enforces variable-length match sizes" {
     const string_user = UserValue{ .string_value = "abc" };
     const bytearray_user = UserValue{
-        .bytearray_value = @constCast(&[_]u8{ 0xaa, 0xbb, 0xcc }),
-        .wildcard_value = @constCast(&[_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED }),
+        .bytearray_value = &[_]u8{ 0xaa, 0xbb, 0xcc },
+        .wildcard_value = &[_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED },
     };
     var scratch: [8]u8 = undefined;
 
@@ -1821,7 +1820,7 @@ test "serializeWriteValue: enforces variable-length match sizes" {
 test "matchReadFlags: supports anynumber matches from stored bits" {
     const flags = try matchReadFlags(.ANYNUMBER, MatchFlags.i32b.bits());
 
-    try std.testing.expectEqual(@as(u16, MatchFlags.i32b.bits()), flags.bits());
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), flags.bits());
     try std.testing.expectError(ScannerError.UnsupportedReadDataType, matchReadFlags(.ANYNUMBER, 0));
 }
 

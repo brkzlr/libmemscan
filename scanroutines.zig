@@ -614,8 +614,7 @@ fn bytearrayEqualRoutine(memory: []const u8, _: ?*const Value, user_values: []co
         if (byte != (memory[i] & @intFromEnum(wildcard))) return .noMatch();
     }
 
-    const len_u16: u16 = @intCast(bytes.len);
-    return .{ .matched_len = bytes.len, .save = .{ .VARIABLE_LENGTH = len_u16 } };
+    return .{ .matched_len = bytes.len, .save = .{ .VARIABLE_LENGTH = @intCast(bytes.len) } };
 }
 
 fn stringEqualRoutine(memory: []const u8, _: ?*const Value, user_values: []const UserValue) ScanResult {
@@ -623,8 +622,7 @@ fn stringEqualRoutine(memory: []const u8, _: ?*const Value, user_values: []const
     if (memory.len < text.len) return .noMatch();
     if (!std.mem.eql(u8, memory[0..text.len], text)) return .noMatch();
 
-    const len_u16: u16 = @intCast(text.len);
-    return .{ .matched_len = text.len, .save = .{ .VARIABLE_LENGTH = len_u16 } };
+    return .{ .matched_len = text.len, .save = .{ .VARIABLE_LENGTH = @intCast(text.len) } };
 }
 
 fn variableLengthAnyRoutine(memory: []const u8, _: ?*const Value, _: []const UserValue) ScanResult {
@@ -633,18 +631,18 @@ fn variableLengthAnyRoutine(memory: []const u8, _: ?*const Value, _: []const Use
 
     return .{
         .matched_len = len,
-        .save = .{ .VARIABLE_LENGTH = @intCast(len) },
+        .save = .{ .VARIABLE_LENGTH = len },
     };
 }
 
 fn variableLengthUpdateRoutine(memory: []const u8, old_value: ?*const Value, _: []const UserValue) ScanResult {
     const previous = old_value orelse return .noMatch();
-    const len = @min(memory.len, @as(usize, previous.flags.bits()));
+    const len = @min(memory.len, previous.flags.bits());
     if (len == 0) return .noMatch();
 
     return .{
         .matched_len = len,
-        .save = .{ .VARIABLE_LENGTH = @intCast(len) },
+        .save = .{ .VARIABLE_LENGTH = len },
     };
 }
 
@@ -727,25 +725,26 @@ test "MATCHEQUALTO-INTEGER32: matches both signed and unsigned flags when possib
     const memory: u32 = 42;
     const result = routine(std.mem.asBytes(&memory), null, &.{user});
 
-    try std.testing.expectEqual(@as(usize, 4), result.matched_len);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u32b = true, .s32b = true }).bits()), result.save.raw());
+    try std.testing.expectEqual(4, result.matched_len);
+    try std.testing.expectEqual((MatchFlags{ .u32b = true, .s32b = true }).bits(), result.save.raw());
 }
 
 test "reverseEndianness: integer equalto swaps compared bytes" {
     const user = try UserValue.parseNumber("0x1234");
-    const swapped: u16 = @byteSwap(@as(u16, 0x1234));
+    const original: u16 = 0x1234;
+    const swapped = @byteSwap(original);
     const memory = std.mem.asBytes(&swapped);
 
     const native_routine = chooseRoutine(.INTEGER16, .MATCHEQUALTO, &.{user}, false).?;
     const native_result = native_routine(memory, null, &.{user});
-    try std.testing.expectEqual(@as(usize, 0), native_result.matched_len);
-    try std.testing.expectEqual(@as(u16, 0), native_result.save.raw());
+    try std.testing.expectEqual(0, native_result.matched_len);
+    try std.testing.expectEqual(0, native_result.save.raw());
 
     const reverse_routine = chooseRoutine(.INTEGER16, .MATCHEQUALTO, &.{user}, true).?;
     const result = reverse_routine(memory, null, &.{user});
 
-    try std.testing.expectEqual(@as(usize, 2), result.matched_len);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u16b = true, .s16b = true }).bits()), result.save.raw());
+    try std.testing.expectEqual(2, result.matched_len);
+    try std.testing.expectEqual((MatchFlags{ .u16b = true, .s16b = true }).bits(), result.save.raw());
 }
 
 test "MATCHCHANGED: compares against old value" {
@@ -757,14 +756,14 @@ test "MATCHCHANGED: compares against old value" {
 
     const unchanged: u32 = 10;
     const unchanged_result = routine(std.mem.asBytes(&unchanged), &old_value, &.{});
-    try std.testing.expectEqual(@as(usize, 0), unchanged_result.matched_len);
-    try std.testing.expectEqual(@as(u16, 0), unchanged_result.save.raw());
+    try std.testing.expectEqual(0, unchanged_result.matched_len);
+    try std.testing.expectEqual(0, unchanged_result.save.raw());
 
     const changed: u32 = 11;
     const result = routine(std.mem.asBytes(&changed), &old_value, &.{});
 
-    try std.testing.expectEqual(@as(usize, 4), result.matched_len);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u32b = true }).bits()), result.save.raw());
+    try std.testing.expectEqual(4, result.matched_len);
+    try std.testing.expectEqual((MatchFlags{ .u32b = true }).bits(), result.save.raw());
 }
 
 test "MATCHRANGE-FLOAT: matches inside inclusive bounds" {
@@ -775,8 +774,8 @@ test "MATCHRANGE-FLOAT: matches inside inclusive bounds" {
     const memory: f32 = 2.0;
     const result = routine(std.mem.asBytes(&memory), null, &.{ lower, upper });
 
-    try std.testing.expectEqual(@as(usize, 4), result.matched_len);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .f32b = true }).bits()), result.save.raw());
+    try std.testing.expectEqual(4, result.matched_len);
+    try std.testing.expectEqual((MatchFlags{ .f32b = true }).bits(), result.save.raw());
 }
 
 test "ANYNUMBER: aggregates integer and float matches" {
@@ -784,30 +783,31 @@ test "ANYNUMBER: aggregates integer and float matches" {
     const routine = chooseRoutine(.ANYNUMBER, .MATCHEQUALTO, &.{user}, false).?;
 
     var memory = [_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
-    const float32_bits: u32 = @bitCast(@as(f32, 0.5));
+    const float32_value: f32 = 0.5;
+    const float32_bits: u32 = @bitCast(float32_value);
     std.mem.writeInt(u32, memory[0..4], float32_bits, .little);
     const result = routine(&memory, null, &.{user});
 
-    try std.testing.expectEqual(@as(usize, 4), result.matched_len);
-    try std.testing.expectEqual(@as(u16, (MatchFlags{ .u8b = true, .s8b = true, .u16b = true, .s16b = true, .f32b = true }).bits()), result.save.raw());
+    try std.testing.expectEqual(4, result.matched_len);
+    try std.testing.expectEqual((MatchFlags{ .u8b = true, .s8b = true, .u16b = true, .s16b = true, .f32b = true }).bits(), result.save.raw());
 }
 
 test "BYTEARRAY: honors wildcards" {
     var user = UserValue{};
-    user.bytearray_value = @constCast(&[_]u8{ 0xaa, 0x00, 0xcc });
-    user.wildcard_value = @constCast(&[_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED });
+    user.bytearray_value = &[_]u8{ 0xaa, 0x00, 0xcc };
+    user.wildcard_value = &[_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED };
 
     const routine = chooseRoutine(.BYTEARRAY, .MATCHEQUALTO, &.{user}, false).?;
     const memory = [_]u8{ 0xaa, 0x77, 0xcc };
     const result = routine(&memory, null, &.{user});
 
-    try std.testing.expectEqual(@as(usize, 3), result.matched_len);
-    try std.testing.expectEqual(@as(u16, 3), result.save.raw());
+    try std.testing.expectEqual(3, result.matched_len);
+    try std.testing.expectEqual(3, result.save.raw());
 
     const fixed_mismatch = [_]u8{ 0xaa, 0x77, 0xcd };
     const mismatch_result = routine(&fixed_mismatch, null, &.{user});
-    try std.testing.expectEqual(@as(usize, 0), mismatch_result.matched_len);
-    try std.testing.expectEqual(@as(u16, 0), mismatch_result.save.raw());
+    try std.testing.expectEqual(0, mismatch_result.matched_len);
+    try std.testing.expectEqual(0, mismatch_result.save.raw());
 }
 
 test "MATCHEQUALTO-STRING: matches exact bytes" {
@@ -815,12 +815,12 @@ test "MATCHEQUALTO-STRING: matches exact bytes" {
     const routine = chooseRoutine(.STRING, .MATCHEQUALTO, &.{user}, false).?;
     const result = routine("PINCE rocks", null, &.{user});
 
-    try std.testing.expectEqual(@as(usize, 5), result.matched_len);
-    try std.testing.expectEqual(@as(u16, 5), result.save.raw());
+    try std.testing.expectEqual(5, result.matched_len);
+    try std.testing.expectEqual(5, result.save.raw());
 
     const mismatch_result = routine("PENCE rocks", null, &.{user});
-    try std.testing.expectEqual(@as(usize, 0), mismatch_result.matched_len);
-    try std.testing.expectEqual(@as(u16, 0), mismatch_result.save.raw());
+    try std.testing.expectEqual(0, mismatch_result.matched_len);
+    try std.testing.expectEqual(0, mismatch_result.save.raw());
 }
 
 test "BYTEARRAY: records variable length snapshot size" {
@@ -828,8 +828,8 @@ test "BYTEARRAY: records variable length snapshot size" {
     const memory = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
     const result = routine(&memory, null, &.{});
 
-    try std.testing.expectEqual(@as(usize, 4), result.matched_len);
-    try std.testing.expectEqual(@as(u16, 4), result.save.raw());
+    try std.testing.expectEqual(4, result.matched_len);
+    try std.testing.expectEqual(4, result.save.raw());
 }
 
 test "MATCHUPDATE-STRING: preserves previous variable length" {
@@ -840,6 +840,6 @@ test "MATCHUPDATE-STRING: preserves previous variable length" {
     const routine = chooseRoutine(.STRING, .MATCHUPDATE, &.{}, false).?;
     const result = routine("HELLO, world", &old_value, &.{});
 
-    try std.testing.expectEqual(@as(usize, 5), result.matched_len);
-    try std.testing.expectEqual(@as(u16, 5), result.save.raw());
+    try std.testing.expectEqual(5, result.matched_len);
+    try std.testing.expectEqual(5, result.save.raw());
 }
