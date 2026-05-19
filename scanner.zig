@@ -65,7 +65,7 @@ pub const ScannerError = error{
 } || ProcessError || StorageError || pointerscan.PointerScanError;
 
 pub const ScanOptions = struct {
-    alignment: u16 = 1,
+    alignment: u16 = 0,
     scan_data_type: ScanDataType = .ANYINTEGER,
     scan_level: ScanLevel = .HEAP_STACK_EXE_BSS,
     reverse_endianness: bool = false,
@@ -632,10 +632,9 @@ pub const Scanner = struct {
     }
 
     pub fn initialScan(self: *Scanner, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
-        if (self.options.alignment == 0) return ScannerError.InvalidAlignment;
-
         const prepared = try self.prepareScan(match_type, user_values);
         const handle = &self.process_handle.?;
+        const alignment = effectiveAlignment(self.options.alignment, prepared.data_type);
 
         self.resetMatches();
         const matches = try self.ensureMatchStorage(calculateMaxMatchStorage(self.regions));
@@ -678,7 +677,7 @@ pub const Scanner = struct {
                     region.start + region_offset,
                     buffer[0..bytes_read],
                     scan_chunk.scan_limit,
-                    self.options.alignment,
+                    alignment,
                     &required_extra_bytes,
                     &self.num_matches,
                 );
@@ -700,72 +699,64 @@ pub const Scanner = struct {
     }
 
     pub fn rescanMatches(self: *Scanner, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
-        if (self.options.alignment == 0) return ScannerError.InvalidAlignment;
         const prepared = try self.prepareScan(match_type, user_values);
         const handle = &self.process_handle.?;
-        const existing_matches = self.matches orelse return ScannerError.NoMatches;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const matches = &self.matches.?;
 
-        var byte_count: usize = 0;
-        var count_iter = existing_matches.storedByteIterator();
-        while (count_iter.next() != null) {
-            byte_count += 1;
-        }
-
-        var new_matches = try MatchesArray.init(self.allocator, existing_matches.usedBytes());
-        errdefer new_matches.deinit();
+        const byte_count = matches.storedByteCount();
 
         self.num_matches = 0;
         self.scan_progress = 0;
         self.stop_flag = false;
 
-        var iterator = existing_matches.storedByteIterator();
+        var iterator = matches.storedByteIterator();
+        matches.beginInPlaceRewrite();
+
         var processed: usize = 0;
         var required_extra_bytes: usize = 0;
         var cache = MemoryCache{};
 
         while (iterator.next()) |stored| {
             if (self.stop_flag) break;
+            defer {
+                processed += 1;
+                self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
+            }
 
             if (stored.isMatch()) {
                 const old_length = storedLengthForExistingMatch(prepared.data_type, stored.raw_match_info_bits);
                 if (old_length > 0) {
                     const memory = cache.peek(handle, stored.address, old_length) catch {
                         required_extra_bytes = 0;
-                        processed += 1;
-                        self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
                         continue;
                     };
-                    const old_value = existing_matches.dataToValue(stored.swath_offset, stored.index);
+                    const old_value = stored.value(matches);
                     const result = prepared.routine(memory, &old_value, user_values);
 
                     if (result.matched_len > 0) {
-                        try appendScanResult(&new_matches, stored.address, memory[0], result.save, &self.num_matches);
+                        const raw_bits = result.save.raw();
+                        if (raw_bits != 0) {
+                            try matches.appendInPlaceRewrite(stored.address, memory[0], @bitCast(raw_bits));
+                            self.num_matches += 1;
+                        }
                         required_extra_bytes = result.matched_len - 1;
                     } else if (required_extra_bytes > 0) {
-                        try new_matches.append(stored.address, memory[0], .{});
+                        try matches.appendInPlaceRewrite(stored.address, memory[0], .{});
                         required_extra_bytes -= 1;
                     }
                 }
             } else if (required_extra_bytes > 0) {
                 const memory = cache.peek(handle, stored.address, 1) catch {
                     required_extra_bytes = 0;
-                    processed += 1;
-                    self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
                     continue;
                 };
-                try new_matches.append(stored.address, memory[0], .{});
+                try matches.appendInPlaceRewrite(stored.address, memory[0], .{});
                 required_extra_bytes -= 1;
             }
-
-            processed += 1;
-            self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
         }
 
-        try new_matches.finalize();
-        const new_match_count = self.num_matches;
-        self.resetMatches();
-        self.matches = new_matches;
-        self.num_matches = new_match_count;
+        try matches.finalize();
         self.scan_progress = 1.0;
     }
 
@@ -819,13 +810,21 @@ pub const Scanner = struct {
     }
 
     fn saveCurrentMatchesForUndo(self: *Scanner) ScannerError!void {
-        const matches = self.matches orelse return ScannerError.NoMatches;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const matches = &self.matches.?;
+        try matches.finalize();
         const file = try self.ensureUndoFile();
-        const header = UndoFileHeader.init(self, &matches);
+        const header = UndoFileHeader.init(self, matches);
 
         file.setLength(self.io, 0) catch return ScannerError.UndoIoFailed;
         file.writePositionalAll(self.io, std.mem.asBytes(&header), 0) catch return ScannerError.UndoIoFailed;
-        file.writePositionalAll(self.io, matches.storage[0..matches.used_len], @sizeOf(UndoFileHeader)) catch return ScannerError.UndoIoFailed;
+        var write_offset: u64 = @sizeOf(UndoFileHeader);
+        for (matches.chunks.items) |chunk| {
+            if (chunk.base >= matches.used_len) break;
+            const storage = chunk.data[0..@min(chunk.data.len, matches.used_len - chunk.base)];
+            file.writePositionalAll(self.io, storage, write_offset) catch return ScannerError.UndoIoFailed;
+            write_offset += storage.len;
+        }
         self.undo_available = true;
     }
 
@@ -838,36 +837,36 @@ pub const Scanner = struct {
         try header.validate();
 
         const used_len: usize = @intCast(header.used_len);
+        const max_needed_bytes: usize = @intCast(header.max_needed_bytes);
+        const tail_swath_offset: usize = @intCast(header.tail_swath_offset);
+        const match_count: usize = @intCast(header.match_count);
 
         if (self.matches) |*matches| {
-            if (matches.storage.len >= used_len) {
-                const storage = matches.storage[0..used_len];
-                const storage_bytes = file.readPositionalAll(self.io, storage, @sizeOf(UndoFileHeader)) catch return ScannerError.UndoIoFailed;
-                if (storage_bytes != storage.len) return ScannerError.UndoCorrupt;
-
-                matches.used_len = used_len;
-                matches.max_needed_bytes = @intCast(header.max_needed_bytes);
-                matches.tail_swath_offset = @intCast(header.tail_swath_offset);
-                matches.match_count = @intCast(header.match_count);
-                return header.undoMetadata();
-            }
+            if (matches.capacity_len < used_len) self.resetMatches();
         }
 
-        self.resetMatches();
-        const storage = self.allocator.alignedAlloc(u8, std.mem.Alignment.of(targetmem.SwathHeader), used_len) catch return ScannerError.OutOfMemory;
-        errdefer self.allocator.free(storage);
+        const created_matches = self.matches == null;
+        if (created_matches) {
+            self.matches = try MatchesArray.init(self.allocator, max_needed_bytes);
+        }
+        errdefer if (created_matches) self.resetMatches();
 
-        const storage_bytes = file.readPositionalAll(self.io, storage, @sizeOf(UndoFileHeader)) catch return ScannerError.UndoIoFailed;
-        if (storage_bytes != storage.len) return ScannerError.UndoCorrupt;
-
-        self.matches = .{
-            .allocator = self.allocator,
-            .storage = storage,
-            .used_len = used_len,
-            .max_needed_bytes = @intCast(header.max_needed_bytes),
-            .tail_swath_offset = @intCast(header.tail_swath_offset),
-            .match_count = @intCast(header.match_count),
-        };
+        const matches = &self.matches.?;
+        try matches.resetForStorageLoad(
+            used_len,
+            max_needed_bytes,
+            tail_swath_offset,
+            match_count,
+        );
+        var read_offset: u64 = @sizeOf(UndoFileHeader);
+        for (matches.chunks.items) |*chunk| {
+            if (chunk.base >= matches.used_len) break;
+            const storage = chunk.data[0..@min(chunk.data.len, matches.used_len - chunk.base)];
+            const storage_bytes = file.readPositionalAll(self.io, storage, read_offset) catch return ScannerError.UndoIoFailed;
+            if (storage_bytes != storage.len) return ScannerError.UndoCorrupt;
+            read_offset += storage.len;
+        }
+        matches.finishStorageLoad();
 
         return header.undoMetadata();
     }
@@ -1129,6 +1128,16 @@ fn totalRegionBytes(regions: []const Region) usize {
     return total;
 }
 
+fn effectiveAlignment(alignment: u16, data_type: ScanDataType) u16 {
+    if (alignment != 0) return alignment;
+    return switch (data_type) {
+        .INTEGER16 => 2,
+        .INTEGER32, .FLOAT32 => 4,
+        .INTEGER64, .FLOAT64 => 8,
+        else => 1,
+    };
+}
+
 fn calculateMaxMatchStorage(regions: []const Region) usize {
     var total: usize = @sizeOf(targetmem.SwathHeader);
     for (regions) |region| {
@@ -1163,7 +1172,7 @@ test "Init: starts detached with defaults" {
     try std.testing.expect(scanner.fresh_session);
     try std.testing.expect(!scanner.stop_flag);
     try std.testing.expectEqual(0, scanner.scan_progress);
-    try std.testing.expectEqual(1, scanner.options.alignment);
+    try std.testing.expectEqual(0, scanner.options.alignment);
     try std.testing.expectEqual(ScanDataType.ANYINTEGER, scanner.options.scan_data_type);
     try std.testing.expectEqual(ScanLevel.HEAP_STACK_EXE_BSS, scanner.options.scan_level);
     try std.testing.expect(!scanner.options.reverse_endianness);
@@ -1255,15 +1264,13 @@ test "ensureMatchStorage: allocates lazily" {
     const matches = try scanner.ensureMatchStorage(256);
     try std.testing.expectEqual(0, matches.matchCount());
     try std.testing.expect(scanner.matches != null);
-    try std.testing.expect(matches.storage.len >= @sizeOf(targetmem.SwathHeader));
-    try std.testing.expect(matches.storage.len <= 256);
+    try std.testing.expect(matches.capacity_len >= @sizeOf(targetmem.SwathHeader));
+    try std.testing.expect(matches.capacity_len <= 256);
     try std.testing.expectEqual(256, matches.max_needed_bytes);
 
-    const storage_ptr = scanner.matches.?.storage.ptr;
-    const storage_len = scanner.matches.?.storage.len;
+    const storage_capacity = scanner.matches.?.capacity_len;
     const reused = try scanner.ensureMatchStorage(512);
-    try std.testing.expectEqual(storage_ptr, reused.storage.ptr);
-    try std.testing.expectEqual(storage_len, reused.storage.len);
+    try std.testing.expectEqual(storage_capacity, reused.capacity_len);
     try std.testing.expectEqual(256, reused.max_needed_bytes);
 }
 
@@ -1436,6 +1443,57 @@ test "snapshot: requires a fresh reset state" {
     try std.testing.expectEqual(0, scanner.matchCount());
     try std.testing.expectEqual(0, scanner.scan_progress);
     try std.testing.expect(!scanner.stop_flag);
+}
+
+test "rescanMatches: shrinks integer matches and stores current values" {
+    const allocator = std.testing.allocator;
+
+    const memory = try allocator.alignedAlloc(u8, std.mem.Alignment.of(u32), 16);
+    defer allocator.free(memory);
+    @memset(memory, 0);
+    std.mem.writeInt(u32, memory[0..4], 0x11111111, .native);
+    std.mem.writeInt(u32, memory[8..12], 0x22222222, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+
+    const pid = std.c.getpid();
+    scanner.process_handle = ProcessHandle.attach(scanner.io, pid) catch |err| switch (err) {
+        ProcessError.AttachFailed => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const base_address = @intFromPtr(memory.ptr);
+    scanner.regions = try allocator.alloc(Region, 1);
+    scanner.regions[0] = .{
+        .start = base_address,
+        .size = memory.len,
+        .kind = .HEAP,
+        .flags = .{ .read = true, .write = true, .exec = false, .shared = false, .private = true },
+        .load_addr = 0,
+        .id = 0,
+        .filename = try allocator.dupe(u8, ""),
+    };
+
+    var matches = try MatchesArray.init(allocator, 256);
+    for ([_]usize{ 0, 8 }) |offset| {
+        try matches.append(base_address + offset, memory[offset], MatchFlags.i32b);
+        for (1..4) |i| {
+            try matches.append(base_address + offset + i, memory[offset + i], .{});
+        }
+    }
+    try matches.finalize();
+
+    scanner.matches = matches;
+
+    std.mem.writeInt(u32, memory[8..12], 0x33333333, .native);
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const kept = try scanner.matchAt(0);
+    try std.testing.expectEqual(base_address + 8, kept.address);
+    try std.testing.expectEqual(0x33333333, kept.stored_value.data.uint32_value);
 }
 
 test "removeRegionById: prunes affected matches and shrinks region list" {
@@ -1715,6 +1773,17 @@ test "initialScanChunkDecision: chooses scan limit and region stop from read sha
         try std.testing.expectEqual(case.expected_scan_limit, decision.scan_limit);
         try std.testing.expectEqual(case.expected_stop_region, decision.stop_region);
     }
+}
+
+test "effectiveAlignment: resolves auto alignment by data type" {
+    try std.testing.expectEqual(1, effectiveAlignment(0, .INTEGER8));
+    try std.testing.expectEqual(2, effectiveAlignment(0, .INTEGER16));
+    try std.testing.expectEqual(4, effectiveAlignment(0, .INTEGER32));
+    try std.testing.expectEqual(8, effectiveAlignment(0, .INTEGER64));
+    try std.testing.expectEqual(4, effectiveAlignment(0, .FLOAT32));
+    try std.testing.expectEqual(8, effectiveAlignment(0, .FLOAT64));
+    try std.testing.expectEqual(1, effectiveAlignment(0, .ANYINTEGER));
+    try std.testing.expectEqual(16, effectiveAlignment(16, .INTEGER32));
 }
 
 test "scanChunkIntoMatches: records numeric matches and trailing bytes" {
