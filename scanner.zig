@@ -17,6 +17,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const pointerscan = @import("pointerscan.zig");
 const process = @import("process.zig");
@@ -171,6 +172,7 @@ pub const Scanner = struct {
     regions: []Region = &.{},
     matches: ?MatchesArray = null,
     undo_file: ?std.Io.File = null,
+    undo_path: ?[]u8 = null,
     undo_available: bool = false,
     num_matches: usize = 0,
     scan_progress: f64 = 0,
@@ -792,10 +794,39 @@ pub const Scanner = struct {
 
     fn ensureUndoFile(self: *Scanner) ScannerError!*std.Io.File {
         if (self.undo_file == null) {
-            self.undo_file = std.Io.Dir.createFileAbsolute(self.io, "/tmp/libmemscan-undo.bin", .{
+            const cache_dir = cache_dir: {
+                switch (builtin.os.tag) {
+                    .linux => {
+                        if (std.c.getenv("XDG_CACHE_HOME")) |xdg_cache_home_raw| {
+                            const xdg_cache_home = std.mem.span(xdg_cache_home_raw);
+                            if (xdg_cache_home.len != 0 and std.fs.path.isAbsolute(xdg_cache_home)) {
+                                break :cache_dir std.fs.path.join(self.allocator, &.{ xdg_cache_home, "libmemscan" }) catch return ScannerError.OutOfMemory;
+                            }
+                        }
+
+                        const home = std.mem.span(std.c.getenv("HOME") orelse return ScannerError.UndoIoFailed);
+                        if (home.len == 0 or !std.fs.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
+                        break :cache_dir std.fs.path.join(self.allocator, &.{ home, ".cache", "libmemscan" }) catch return ScannerError.OutOfMemory;
+                    },
+                    .macos => {
+                        const home = std.mem.span(std.c.getenv("HOME") orelse return ScannerError.UndoIoFailed);
+                        if (home.len == 0 or !std.fs.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
+                        break :cache_dir std.fs.path.join(self.allocator, &.{ home, "Library", "Caches", "libmemscan" }) catch return ScannerError.OutOfMemory;
+                    },
+                    else => @compileError("Unsupported platform: " ++ @tagName(builtin.os.tag)),
+                }
+            };
+            defer self.allocator.free(cache_dir);
+
+            std.Io.Dir.createDirPath(.cwd(), self.io, cache_dir) catch return ScannerError.UndoIoFailed;
+            const undo_path = std.fs.path.join(self.allocator, &.{ cache_dir, "libmemscan-undo.bin" }) catch return ScannerError.OutOfMemory;
+            errdefer self.allocator.free(undo_path);
+
+            self.undo_file = std.Io.Dir.createFileAbsolute(self.io, undo_path, .{
                 .read = true,
                 .truncate = true,
             }) catch return ScannerError.UndoIoFailed;
+            self.undo_path = undo_path;
         }
 
         return &self.undo_file.?;
@@ -804,8 +835,12 @@ pub const Scanner = struct {
     fn closeUndoFile(self: *Scanner) void {
         if (self.undo_file) |file| {
             file.close(self.io);
-            std.Io.Dir.deleteFileAbsolute(self.io, "/tmp/libmemscan-undo.bin") catch {};
             self.undo_file = null;
+        }
+        if (self.undo_path) |path| {
+            std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+            self.allocator.free(path);
+            self.undo_path = null;
         }
     }
 
@@ -1349,7 +1384,7 @@ test "storedMatchBytes: returns raw stored bytes" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc }, try scanner.storedMatchBytes(0, &byte_buf));
 }
 
-test "clearUndoHistory: clears temp-file backed undo state" {
+test "clearUndoHistory: clears cache-file backed undo state" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
 
