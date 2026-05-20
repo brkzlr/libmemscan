@@ -600,7 +600,7 @@ const MacOSBackend = struct {
                     // If this is an executable region, read the first 4 bytes of this region and check for Mach-O magic.
                     var magic_buf: [@sizeOf(u32)]u8 = undefined;
                     if ((self.read(io, address, magic_buf[0..]) catch 0) == magic_buf.len) {
-                        const magic = std.mem.readInt(u32, &magic_buf, .little);
+                        const magic = std.mem.readInt(u32, &magic_buf, .native);
 
                         // If we indeed classified this file as Mach-O using the magic at the start of region, cache this image load for other regions' checks.
                         if (magic == std.macho.MH_MAGIC or magic == std.macho.MH_MAGIC_64) {
