@@ -971,173 +971,7 @@ pub const Scanner = struct {
     }
 
     fn rescanFixedWidthCompare(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
-        const handle = &self.process_handle.?;
         if (self.matches == null) return ScannerError.NoMatches;
-        const old_matches = &self.matches.?;
-        if (old_matches.stride == 1) return self.rescanFixedWidthCompareStrideOne(width, match_type, user_values);
-        const total_matches = old_matches.matchCount();
-
-        self.num_matches = 0;
-        self.scan_progress = 0;
-        self.stop_flag = false;
-
-        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
-        errdefer new_matches.deinit();
-
-        var read_cache = MemoryCache{};
-        var write_cache = MemoryCache{};
-        var writer = RescanSpanWriter{
-            .matches = &new_matches,
-            .handle = handle,
-            .cache = &write_cache,
-        };
-
-        var processed: usize = 0;
-        // Pre-select the concrete compare kernel once per pass.
-        // All runtime dispatch on data_type / match_type / endian collapses here,
-        // leaving the per-candidate hot loop with a direct function-pointer call.
-        const kernel = scanroutines.pickFixedCompareKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
-        // Predicate reads current process bytes + user values only, never reads old_matches storage behind the cursor.
-        // Safe to release consumed segments mid-pass, mirroring the stride-1 compare rebuild path.
-        var segments = old_matches.segmentIterator();
-        while (segments.next()) |segment| {
-            if (self.stop_flag) break;
-            try self.rescanCompareSegmentFallbackFrom(old_matches, segment, 0, width, kernel, user_values, &read_cache, &writer, &processed, total_matches);
-            old_matches.releaseStorageBefore(segment.end_offset);
-        }
-
-        try writer.flushBefore(std.math.maxInt(usize));
-        try new_matches.finalize();
-
-        var to_free = self.matches.?;
-        self.matches = new_matches;
-        to_free.deinit();
-
-        self.scan_progress = 1.0;
-    }
-
-    fn rescanFixedWidthChanged(self: *Scanner, width: usize) ScannerError!void {
-        const handle = &self.process_handle.?;
-        if (self.matches == null) return ScannerError.NoMatches;
-        const old_matches = &self.matches.?;
-        if (old_matches.stride == 1) return self.rescanFixedWidthChangedStrideOne(width);
-        const total_matches = old_matches.matchCount();
-
-        self.num_matches = 0;
-        self.scan_progress = 0;
-        self.stop_flag = false;
-
-        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
-        errdefer new_matches.deinit();
-
-        var iterator = old_matches.iterator();
-        var processed: usize = 0;
-        var cache = MemoryCache{};
-        var writer = RescanSpanWriter{
-            .matches = &new_matches,
-            .handle = handle,
-            .cache = &cache,
-        };
-        var old_bytes: [8]u8 = undefined;
-
-        while (iterator.next()) |location| {
-            if (self.stop_flag) break;
-
-            // For fixed-width types stored_len == width.
-            // For ANY-types it is the candidate's per-flag width (1/2/4/8).
-            // Read exactly the stored bytes and preserve the existing raw_bits
-            // since CHANGED never narrows flags.
-            const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
-            if (stored_len != 0 and stored_len <= width) {
-                const memory = cache.peek(handle, location.address, stored_len) catch {
-                    processed += 1;
-                    updateRescanProgress(self, processed, total_matches);
-                    continue;
-                };
-                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
-                // Short stored reads mean we cannot prove the value changed.
-                if (old.len == stored_len and memory.len >= stored_len and !std.mem.eql(u8, memory[0..stored_len], old)) {
-                    try writer.appendMatch(location.address, memory[0], stored_len, location.raw_match_info_bits);
-                    self.num_matches += 1;
-                }
-            }
-
-            processed += 1;
-            updateRescanProgress(self, processed, total_matches);
-        }
-
-        try writer.flushBefore(std.math.maxInt(usize));
-        try new_matches.finalize();
-
-        var to_free = self.matches.?;
-        self.matches = new_matches;
-        to_free.deinit();
-
-        self.scan_progress = 1.0;
-    }
-
-    fn rescanFixedWidthDelta(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
-        const handle = &self.process_handle.?;
-        if (self.matches == null) return ScannerError.NoMatches;
-        const old_matches = &self.matches.?;
-        if (old_matches.stride == 1) return self.rescanFixedWidthDeltaStrideOne(width, match_type, user_values);
-        const total_matches = old_matches.matchCount();
-
-        self.num_matches = 0;
-        self.scan_progress = 0;
-        self.stop_flag = false;
-
-        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
-        errdefer new_matches.deinit();
-
-        var iterator = old_matches.iterator();
-        var processed: usize = 0;
-        var cache = MemoryCache{};
-        var writer = RescanSpanWriter{
-            .matches = &new_matches,
-            .handle = handle,
-            .cache = &cache,
-        };
-        var old_bytes: [8]u8 = undefined;
-        // Pre-select the concrete delta kernel once per pass so the per-location hot loop only does a direct function-pointer call.
-        const kernel = scanroutines.pickFixedDeltaKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
-
-        while (iterator.next()) |location| {
-            if (self.stop_flag) break;
-
-            const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
-            if (stored_len != 0 and stored_len <= width) {
-                const memory = cache.peek(handle, location.address, stored_len) catch {
-                    processed += 1;
-                    updateRescanProgress(self, processed, total_matches);
-                    continue;
-                };
-                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
-                if (old.len == stored_len and memory.len >= stored_len) {
-                    const raw_bits = kernel(memory[0..stored_len], old, location.raw_match_info_bits, user_values);
-                    if (raw_bits != 0) {
-                        const matched_len = flagsToNumericLength(@bitCast(raw_bits));
-                        try writer.appendMatch(location.address, memory[0], matched_len, raw_bits);
-                        self.num_matches += 1;
-                    }
-                }
-            }
-
-            processed += 1;
-            updateRescanProgress(self, processed, total_matches);
-        }
-
-        try writer.flushBefore(std.math.maxInt(usize));
-        try new_matches.finalize();
-
-        var to_free = self.matches.?;
-        self.matches = new_matches;
-        to_free.deinit();
-
-        self.scan_progress = 1.0;
-    }
-
-    fn rescanFixedWidthCompareStrideOne(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
         const handle = &self.process_handle.?;
         const old_matches = &self.matches.?;
         const total_matches = old_matches.matchCount();
@@ -1156,7 +990,7 @@ pub const Scanner = struct {
             .handle = handle,
             .cache = &write_cache,
         };
-        const raw_bits_scratch = try self.allocator.alloc(u16, MemoryCache.read_chunk_size);
+        const raw_bits_scratch = try self.allocator.alloc(u16, stridedBatchLimit(@sizeOf(u8), old_matches.stride));
         defer self.allocator.free(raw_bits_scratch);
 
         var processed: usize = 0;
@@ -1166,18 +1000,18 @@ pub const Scanner = struct {
         const kernel = scanroutines.pickFixedCompareKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
         // For fixed concrete numeric MATCHEQUALTO over a full-shared stride-1 segment
         // we can replace the per-candidate kernel call with a direct byte search against pre-serialized needle(s).
-        // "fullSharedStrideOneWidth" guarantees the segment is the entire old candidate set, so every hit is in-bounds.
+        // With stride 1, every offset before "valid" is an old candidate start, so every direct-search hit is in-bounds.
         // Reused across segments, serialize once.
         var primary_buf: [8]u8 = undefined;
         var secondary_buf: [8]u8 = undefined;
-        const exact_needles: ?ExactNumericNeedles = if (match_type == .MATCHEQUALTO and user_values.len > 0)
+        const exact_needles: ?ExactNumericNeedles = if (old_matches.stride == 1 and match_type == .MATCHEQUALTO and user_values.len > 0)
             serializeExactNumericNeedles(self.options.scan_data_type, user_values[0], self.options.reverse_endianness, &primary_buf, &secondary_buf)
         else
             null;
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
             if (self.stop_flag) break;
-            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+            if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 if (exact_needles) |needles| {
                     try self.rescanExactFullSegment(old_matches, segment, segment_width, needles, kernel, user_values, &read_cache, &writer, &processed, total_matches);
                 } else {
@@ -1199,7 +1033,8 @@ pub const Scanner = struct {
         self.scan_progress = 1.0;
     }
 
-    fn rescanFixedWidthChangedStrideOne(self: *Scanner, width: usize) ScannerError!void {
+    fn rescanFixedWidthChanged(self: *Scanner, width: usize) ScannerError!void {
+        if (self.matches == null) return ScannerError.NoMatches;
         const handle = &self.process_handle.?;
         const old_matches = &self.matches.?;
         const total_matches = old_matches.matchCount();
@@ -1222,7 +1057,7 @@ pub const Scanner = struct {
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
             if (self.stop_flag) break;
-            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+            if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 try self.rescanChangedFullSegment(old_matches, segment, segment_width, raw_bits, &read_cache, &writer, &processed, total_matches);
             } else {
@@ -1241,7 +1076,8 @@ pub const Scanner = struct {
         self.scan_progress = 1.0;
     }
 
-    fn rescanFixedWidthDeltaStrideOne(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+    fn rescanFixedWidthDelta(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        if (self.matches == null) return ScannerError.NoMatches;
         const handle = &self.process_handle.?;
         const old_matches = &self.matches.?;
         const total_matches = old_matches.matchCount();
@@ -1260,7 +1096,7 @@ pub const Scanner = struct {
             .handle = handle,
             .cache = &write_cache,
         };
-        const raw_bits_scratch = try self.allocator.alloc(u16, MemoryCache.read_chunk_size);
+        const raw_bits_scratch = try self.allocator.alloc(u16, stridedBatchLimit(@sizeOf(u8), old_matches.stride));
         defer self.allocator.free(raw_bits_scratch);
 
         var processed: usize = 0;
@@ -1269,7 +1105,7 @@ pub const Scanner = struct {
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
             if (self.stop_flag) break;
-            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+            if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 try self.rescanDeltaFullSegment(old_matches, segment, segment_width, raw_bits, kernel, match_type, user_values, &read_cache, &writer, raw_bits_scratch, &processed, total_matches);
             } else {
@@ -1289,43 +1125,7 @@ pub const Scanner = struct {
     }
 
     fn rescanFixedWidthNotChanged(self: *Scanner, width: usize) ScannerError!void {
-        const handle = &self.process_handle.?;
         if (self.matches == null) return ScannerError.NoMatches;
-        const matches = &self.matches.?;
-        if (matches.stride == 1) return self.rescanFixedWidthNotChangedStrideOne(width);
-        const total_matches = matches.matchCount();
-
-        self.scan_progress = 0;
-        self.stop_flag = false;
-
-        var iterator = matches.iterator();
-        var processed: usize = 0;
-        var cache = MemoryCache{};
-        var old_bytes: [8]u8 = undefined;
-
-        while (iterator.next()) |location| {
-            if (self.stop_flag) break;
-
-            const keep = keep: {
-                const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
-                if (stored_len == 0 or stored_len > width) break :keep false;
-                const memory = cache.peek(handle, location.address, stored_len) catch break :keep false;
-                const old = matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
-                break :keep old.len == stored_len and memory.len >= stored_len and std.mem.eql(u8, memory[0..stored_len], old);
-            };
-            // The iterator has already advanced past this match.
-            // Removing the current result cannot invalidate its future-position caches.
-            if (!keep) matches.removeMatch(location);
-
-            processed += 1;
-            updateRescanProgress(self, processed, total_matches);
-        }
-
-        self.num_matches = matches.matchCount();
-        self.scan_progress = 1.0;
-    }
-
-    fn rescanFixedWidthNotChangedStrideOne(self: *Scanner, width: usize) ScannerError!void {
         const matches = &self.matches.?;
         const total_matches = matches.matchCount();
 
@@ -1337,7 +1137,7 @@ pub const Scanner = struct {
         var segments = matches.segmentIterator();
         while (segments.next()) |segment| {
             if (self.stop_flag) break;
-            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+            if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 self.rescanNotChangedFullSegment(matches, segment, segment_width, raw_bits, &cache, &processed, total_matches);
             } else {
@@ -1363,26 +1163,28 @@ pub const Scanner = struct {
         total_matches: usize,
     ) ScannerError!void {
         const handle = &self.process_handle.?;
+        const stride: usize = old_matches.stride;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
             if (self.stop_flag) break;
 
-            const batch_len = @min(segment.candidate_count - candidate, MemoryCache.read_chunk_size - width + 1);
-            const window_len = batch_len + width - 1;
-            const address = segment.first_candidate + candidate;
+            const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
+            const window_len = stridedWindowLen(batch_len, stride, width);
+            const address = segment.first_candidate + candidate * stride;
             const current = cache.peek(handle, address, window_len) catch {
-                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate * stride, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             };
-            const valid = if (current.len >= width) @min(batch_len, current.len - width + 1) else 0;
+            const valid = stridedValidCandidates(current.len, width, stride, batch_len);
             if (valid == 0) {
-                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate * stride, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             }
 
             var survivor_count: usize = 0;
             for (0..valid) |i| {
-                const raw_bits = kernel(current[i .. i + width], user_values);
+                const byte_offset = i * stride;
+                const raw_bits = kernel(current[byte_offset .. byte_offset + width], user_values);
                 raw_bits_scratch[i] = raw_bits;
                 if (raw_bits != 0) {
                     survivor_count += 1;
@@ -1390,14 +1192,16 @@ pub const Scanner = struct {
             }
 
             if (survivor_count * 4 >= valid) {
-                const trailing_end = std.math.add(usize, address, valid + width - 1) catch return ScannerError.ReadFailed;
-                try writer.appendBatch(address, current[0..valid], raw_bits_scratch[0..valid], trailing_end);
+                const stored_len = stridedFirstBytesLen(valid, stride);
+                const trailing_end = std.math.add(usize, address, stridedWindowLen(valid, stride, width)) catch return ScannerError.ReadFailed;
+                try writer.appendBatch(address, current[0..stored_len], raw_bits_scratch[0..valid], trailing_end);
                 self.num_matches += survivor_count;
             } else {
                 for (raw_bits_scratch[0..valid], 0..) |raw_bits, i| {
                     if (raw_bits == 0) continue;
                     const matched_len = flagsToNumericLength(@bitCast(raw_bits));
-                    try writer.appendMatch(address + i, current[i], matched_len, raw_bits);
+                    const byte_offset = i * stride;
+                    try writer.appendMatch(address + byte_offset, current[byte_offset], matched_len, raw_bits);
                     self.num_matches += 1;
                 }
             }
@@ -1406,7 +1210,7 @@ pub const Scanner = struct {
             processed.* += valid;
             updateRescanProgress(self, processed.*, total_matches);
             if (valid < batch_len) {
-                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate * stride, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             }
         }
@@ -1415,8 +1219,7 @@ pub const Scanner = struct {
     /// Fixed concrete numeric MATCHEQUALTO over a full-shared stride-1 segment.
     /// Searches the segment's current bytes with "std.mem.indexOfPos" against pre-serialized needle(s)
     /// instead of running the compare kernel at every candidate.
-    /// Safe because `fullSharedStrideOneWidth` guarantees every position in "[first_candidate, first_candidate + candidate_count)"
-    /// was a candidate in the prior match set, so no risk of discovering addresses outside it.
+    /// Safe because "fullSharedSegmentWidth" plus stride 1 guarantees every hit before "valid" is in the old candidate set.
     /// Read failures fall back to the iterator path (which uses "kernel") so partial reads still respect the old candidate set.
     fn rescanExactFullSegment(
         self: *Scanner,
@@ -1551,28 +1354,30 @@ pub const Scanner = struct {
         total_matches: usize,
     ) ScannerError!void {
         const handle = &self.process_handle.?;
+        const stride: usize = old_matches.stride;
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
             if (self.stop_flag) break;
 
-            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
-            const window_len = batch_len + width - 1;
-            const address = segment.first_candidate + candidate;
-            const old = old_matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
-            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
+            const window_len = stridedWindowLen(batch_len, stride, width);
+            const byte_index = candidate * stride;
+            const address = segment.first_candidate + byte_index;
+            const old = old_matches.dataToBytes(segment.swath_offset, byte_index, window_len, &old_buf);
+            const valid = stridedValidCandidates(old.len, width, stride, batch_len);
             if (valid == 0) {
-                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, byte_index, width, cache, writer, processed, total_matches);
                 return;
             }
 
-            const valid_window_len = valid + width - 1;
+            const valid_window_len = stridedWindowLen(valid, stride, width);
             const current = cache.peek(handle, address, valid_window_len) catch {
-                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, byte_index, width, cache, writer, processed, total_matches);
                 return;
             };
 
-            if (!std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
+            if (stride == 1 and !std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
                 var diff_count: usize = 0;
                 for (0..width) |i| {
                     if (current[i] != old[i]) diff_count += 1;
@@ -1587,13 +1392,21 @@ pub const Scanner = struct {
                         if (current[i + width] != old[i + width]) diff_count += 1;
                     }
                 }
+            } else if (stride != 1) {
+                for (0..valid) |i| {
+                    const byte_offset = i * stride;
+                    if (!std.mem.eql(u8, current[byte_offset .. byte_offset + width], old[byte_offset .. byte_offset + width])) {
+                        try writer.appendMatch(address + byte_offset, current[byte_offset], width, raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
             }
 
             candidate += valid;
             processed.* += valid;
             updateRescanProgress(self, processed.*, total_matches);
             if (valid < batch_len) {
-                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate * stride, width, cache, writer, processed, total_matches);
                 return;
             }
         }
@@ -1688,26 +1501,62 @@ pub const Scanner = struct {
             scanroutines.pickFixedDeltaKernel(.FLOAT64, match_type, self.options.reverse_endianness)
         else
             undefined;
+        const stride: usize = old_matches.stride;
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
             if (self.stop_flag) break;
 
-            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
-            const window_len = batch_len + width - 1;
-            const address = segment.first_candidate + candidate;
-            const old = old_matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
-            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
+            const window_len = stridedWindowLen(batch_len, stride, width);
+            const byte_index = candidate * stride;
+            const address = segment.first_candidate + byte_index;
+            const old = old_matches.dataToBytes(segment.swath_offset, byte_index, window_len, &old_buf);
+            const valid = stridedValidCandidates(old.len, width, stride, batch_len);
             if (valid == 0) {
-                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, byte_index, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             }
 
-            const valid_window_len = valid + width - 1;
+            const valid_window_len = stridedWindowLen(valid, stride, width);
             const current = cache.peek(handle, address, valid_window_len) catch {
-                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, byte_index, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             };
+
+            if (stride != 1) {
+                var survivor_count: usize = 0;
+                for (0..valid) |i| {
+                    const byte_offset = i * stride;
+                    const new_raw_bits = kernel(current[byte_offset .. byte_offset + width], old[byte_offset .. byte_offset + width], raw_bits, user_values);
+                    raw_bits_scratch[i] = new_raw_bits;
+                    if (new_raw_bits != 0) survivor_count += 1;
+                }
+
+                if (survivor_count * 4 >= valid) {
+                    const stored_len = stridedFirstBytesLen(valid, stride);
+                    const trailing_end = std.math.add(usize, address, valid_window_len) catch return ScannerError.ReadFailed;
+                    try writer.appendBatch(address, current[0..stored_len], raw_bits_scratch[0..valid], trailing_end);
+                    self.num_matches += survivor_count;
+                } else if (survivor_count != 0) {
+                    for (raw_bits_scratch[0..valid], 0..) |new_raw_bits, i| {
+                        if (new_raw_bits == 0) continue;
+                        const matched_len = flagsToNumericLength(@bitCast(new_raw_bits));
+                        const byte_offset = i * stride;
+                        try writer.appendMatch(address + byte_offset, current[byte_offset], matched_len, new_raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
+
+                candidate += valid;
+                processed.* += valid;
+                updateRescanProgress(self, processed.*, total_matches);
+                if (valid < batch_len) {
+                    try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate * stride, width, kernel, user_values, cache, writer, processed, total_matches);
+                    return;
+                }
+                continue;
+            }
 
             // Candidates whose value-width window is byte-identical to the stored bytes cannot have increased or decreased
             // (true for both int and float, including NaN: identical bits -> identical value or both NaN, neither > nor <).
@@ -1838,7 +1687,7 @@ pub const Scanner = struct {
             processed.* += valid;
             updateRescanProgress(self, processed.*, total_matches);
             if (valid < batch_len) {
-                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate * stride, width, kernel, user_values, cache, writer, processed, total_matches);
                 return;
             }
         }
@@ -1903,28 +1752,30 @@ pub const Scanner = struct {
         total_matches: usize,
     ) void {
         const handle = &self.process_handle.?;
+        const stride: usize = matches.stride;
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
             if (self.stop_flag) break;
 
-            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
-            const window_len = batch_len + width - 1;
-            const address = segment.first_candidate + candidate;
-            const old = matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
-            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
+            const window_len = stridedWindowLen(batch_len, stride, width);
+            const byte_index = candidate * stride;
+            const address = segment.first_candidate + byte_index;
+            const old = matches.dataToBytes(segment.swath_offset, byte_index, window_len, &old_buf);
+            const valid = stridedValidCandidates(old.len, width, stride, batch_len);
             if (valid == 0) {
-                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, byte_index, width, cache, processed, total_matches);
                 return;
             }
 
-            const valid_window_len = valid + width - 1;
+            const valid_window_len = stridedWindowLen(valid, stride, width);
             const current = cache.peek(handle, address, valid_window_len) catch {
-                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, byte_index, width, cache, processed, total_matches);
                 return;
             };
 
-            if (!std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
+            if (stride == 1 and !std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
                 var diff_count: usize = 0;
                 for (0..width) |i| {
                     if (current[i] != old[i]) diff_count += 1;
@@ -1943,13 +1794,25 @@ pub const Scanner = struct {
                         if (current[i + width] != old[i + width]) diff_count += 1;
                     }
                 }
+            } else if (stride != 1) {
+                for (0..valid) |i| {
+                    const byte_offset = i * stride;
+                    if (!std.mem.eql(u8, current[byte_offset .. byte_offset + width], old[byte_offset .. byte_offset + width])) {
+                        matches.removeMatch(.{
+                            .swath_offset = segment.swath_offset,
+                            .index = byte_index + byte_offset,
+                            .address = address + byte_offset,
+                            .raw_match_info_bits = raw_bits,
+                        });
+                    }
+                }
             }
 
             candidate += valid;
             processed.* += valid;
             updateRescanProgress(self, processed.*, total_matches);
             if (valid < batch_len) {
-                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate * stride, width, cache, processed, total_matches);
                 return;
             }
         }
@@ -2788,7 +2651,7 @@ fn bytearrayMatches(memory: []const u8, pattern: []const u8, wildcards: []const 
     return true;
 }
 
-fn fullSharedStrideOneWidth(segment: targetmem.SegmentView, data_type: ScanDataType, max_width: usize) ?usize {
+fn fullSharedSegmentWidth(segment: targetmem.SegmentView, data_type: ScanDataType, max_width: usize) ?usize {
     if (segment.header.match_count == 0 or
         segment.first_candidate != segment.header.first_byte_in_child or
         segment.header.layout != .shared_raw_bits or
@@ -2805,6 +2668,28 @@ fn fullSharedStrideOneWidth(segment: targetmem.SegmentView, data_type: ScanDataT
         .INTEGER8, .INTEGER16, .INTEGER32, .INTEGER64, .FLOAT32, .FLOAT64 => if (stored_width == max_width) stored_width else null,
         .BYTEARRAY, .STRING => null,
     };
+}
+
+fn stridedBatchLimit(width: usize, stride: usize) usize {
+    std.debug.assert(stride != 0);
+    std.debug.assert(width <= MemoryCache.read_chunk_size);
+    return 1 + (MemoryCache.read_chunk_size - width) / stride;
+}
+
+fn stridedWindowLen(candidate_count: usize, stride: usize, width: usize) usize {
+    std.debug.assert(candidate_count != 0);
+    return (candidate_count - 1) * stride + width;
+}
+
+fn stridedFirstBytesLen(candidate_count: usize, stride: usize) usize {
+    std.debug.assert(candidate_count != 0);
+    return (candidate_count - 1) * stride + 1;
+}
+
+fn stridedValidCandidates(byte_len: usize, width: usize, stride: usize, batch_len: usize) usize {
+    std.debug.assert(stride != 0);
+    if (byte_len < width) return 0;
+    return @min(batch_len, 1 + (byte_len - width) / stride);
 }
 
 inline fn updateProgress(scanner: *Scanner, processed: usize, total: usize) void {
@@ -3951,7 +3836,7 @@ test "rescanMatches: fixed integer changed batches full stride-one segment" {
 test "rescanMatches: fixed integer exact stride one and stride four agree on aligned matches" {
     const allocator = std.testing.allocator;
 
-    var memory: [24]u8 = @splat(0);
+    var memory: [24]u8 align(4) = @splat(0);
     std.mem.writeInt(u32, memory[4..8], 5, .native);
     std.mem.writeInt(u32, memory[12..16], 5, .native);
 
@@ -4014,6 +3899,93 @@ test "rescanMatches: fixed integer exact stride one and stride four agree on ali
     }
 }
 
+test "rescanMatches: fixed integer dense align-four rescans use candidate stride" {
+    const allocator = std.testing.allocator;
+    const raw_bits = MatchFlags.i32b.bits();
+    const old_values: [16]u8 = @splat(0);
+
+    {
+        var memory: [16]u8 align(4) = @splat(0);
+        var scanner = Scanner.init(allocator, std.testing.io);
+        defer scanner.deinit();
+        scanner.options.alignment = 4;
+        scanner.options.scan_data_type = .INTEGER32;
+        try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+        const base_address = @intFromPtr(&memory);
+        var matches = try MatchesArray.init(allocator, 256, 4);
+        try matches.appendRun(base_address, &old_values, raw_bits, old_values.len / 4);
+        try matches.finalize();
+        scanner.matches = matches;
+        scanner.num_matches = matches.matchCount();
+
+        std.mem.writeInt(u32, memory[4..8], 1, .native);
+        std.mem.writeInt(u32, memory[12..16], 1, .native);
+        try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+        try scanner.matches.?.validate();
+        try std.testing.expectEqual(2, scanner.matchCount());
+        try std.testing.expectEqual(base_address + 4, (try scanner.matchAt(0)).address);
+        try std.testing.expectEqual(base_address + 12, (try scanner.matchAt(1)).address);
+    }
+
+    {
+        var memory: [16]u8 align(4) = @splat(0);
+        var scanner = Scanner.init(allocator, std.testing.io);
+        defer scanner.deinit();
+        scanner.options.alignment = 4;
+        scanner.options.scan_data_type = .INTEGER32;
+        try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+        const base_address = @intFromPtr(&memory);
+        var matches = try MatchesArray.init(allocator, 256, 4);
+        try matches.appendRun(base_address, &old_values, raw_bits, old_values.len / 4);
+        try matches.finalize();
+        scanner.matches = matches;
+        scanner.num_matches = matches.matchCount();
+
+        std.mem.writeInt(u32, memory[0..4], 1, .native);
+        std.mem.writeInt(u32, memory[8..12], 1, .native);
+        const delta = UserValue{
+            .int32_value = 1,
+            .uint32_value = 1,
+            .flags = MatchFlags.i32b,
+        };
+        try scanner.rescanMatches(.MATCHINCREASEDBY, &.{delta});
+
+        try scanner.matches.?.validate();
+        try std.testing.expectEqual(2, scanner.matchCount());
+        try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+        try std.testing.expectEqual(base_address + 8, (try scanner.matchAt(1)).address);
+    }
+
+    {
+        var memory: [16]u8 align(4) = @splat(0);
+        var scanner = Scanner.init(allocator, std.testing.io);
+        defer scanner.deinit();
+        scanner.options.alignment = 4;
+        scanner.options.scan_data_type = .INTEGER32;
+        try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+        const base_address = @intFromPtr(&memory);
+        var matches = try MatchesArray.init(allocator, 256, 4);
+        try matches.appendRun(base_address, &old_values, raw_bits, old_values.len / 4);
+        try matches.finalize();
+        scanner.matches = matches;
+        scanner.num_matches = matches.matchCount();
+
+        std.mem.writeInt(u32, memory[4..8], 1, .native);
+        try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+        try scanner.matches.?.validate();
+        try std.testing.expectEqual(3, scanner.matchCount());
+        try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+        try std.testing.expectEqual(base_address + 8, (try scanner.matchAt(1)).address);
+        try std.testing.expectEqual(base_address + 12, (try scanner.matchAt(2)).address);
+        try std.testing.expectEqual(null, scanner.matches.?.findMatchIndexByAddress(base_address + 4));
+    }
+}
+
 test "rescanMatches: fixed integer exact dense batch preserves trailing bytes" {
     const allocator = std.testing.allocator;
 
@@ -4064,7 +4036,7 @@ test "rescanMatches: fixed integer exact full segment direct search confines hit
     const base_address = @intFromPtr(buffer.ptr);
     // Full stride-1 width-4 segment of exactly 4 candidates (offsets 0..3).
     // appendRun with len==candidate_count yields match_count==candidate_count,
-    // which is what fullSharedStrideOneWidth requires before dispatching into
+    // which is what fullSharedSegmentWidth requires before dispatching into
     // the indexOfPos-based rescanExactFullSegment path.
     const old_values: [4]u8 = @splat(0);
     var matches = try MatchesArray.init(allocator, 256, 1);
@@ -4846,7 +4818,45 @@ test "rescanMatches: anyinteger notchanged preserves matching stored sub-width" 
     try std.testing.expectEqual((MatchFlags{ .u16b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
 }
 
-test "fullSharedStrideOneWidth: accepts ANY sub-width shared segments" {
+test "rescanMatches: anyinteger narrow full segment uses max candidate batch" {
+    const allocator = std.testing.allocator;
+    const candidate_count = MemoryCache.read_chunk_size;
+    const max_storage = 128 * 1024;
+
+    const memory = try allocator.alloc(u8, candidate_count);
+    defer allocator.free(memory);
+    @memset(memory, 7);
+
+    const old_values = try allocator.alloc(u8, candidate_count);
+    defer allocator.free(old_values);
+    @memset(old_values, 0);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.alignment = 1;
+    scanner.options.scan_data_type = .ANYINTEGER;
+    try attachScannerToTestMemory(&scanner, allocator, memory);
+
+    var matches = try MatchesArray.init(allocator, max_storage, 1);
+    try matches.appendRun(@intFromPtr(memory.ptr), old_values, MatchFlags.i8b.bits(), candidate_count);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const equal_to = try UserValue.parseNumber("7");
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{equal_to});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(candidate_count, scanner.matchCount());
+
+    @memset(memory, 8);
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(candidate_count, scanner.matchCount());
+}
+
+test "fullSharedSegmentWidth: accepts ANY sub-width shared segments" {
     var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     defer matches.deinit();
 
@@ -4856,10 +4866,10 @@ test "fullSharedStrideOneWidth: accepts ANY sub-width shared segments" {
 
     var segments = matches.segmentIterator();
     const segment = segments.next().?;
-    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .ANYINTEGER, 8).?);
-    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .ANYNUMBER, 8).?);
-    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .INTEGER16, 2).?);
-    try std.testing.expect(fullSharedStrideOneWidth(segment, .INTEGER64, 8) == null);
+    try std.testing.expectEqual(2, fullSharedSegmentWidth(segment, .ANYINTEGER, 8).?);
+    try std.testing.expectEqual(2, fullSharedSegmentWidth(segment, .ANYNUMBER, 8).?);
+    try std.testing.expectEqual(2, fullSharedSegmentWidth(segment, .INTEGER16, 2).?);
+    try std.testing.expect(fullSharedSegmentWidth(segment, .INTEGER64, 8) == null);
 }
 
 test "rescanMatches: anynumber increased keeps integer survivor and drops NaN float flag" {
