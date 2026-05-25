@@ -1276,7 +1276,29 @@ pub const Scanner = struct {
                     consumed_primary = false;
                 } else break;
                 if (h >= valid) break;
+                // Collapse self-overlapping primary runs, e.g. exact zero in zero-filled memory.
                 if (consumed_primary) {
+                    var burst_end = h + 1;
+                    while (burst_end < valid and
+                        std.mem.eql(u8, current[burst_end .. burst_end + needles.primary.len], needles.primary)) : (burst_end += 1)
+                    {}
+                    if (burst_end > h + 1) {
+                        const burst_len = burst_end - h;
+                        try writer.flushBefore(address + h);
+                        try writer.matches.appendRun(address + h, current[h..burst_end], needles.raw_bits, burst_len);
+                        self.num_matches += burst_len;
+                        writer.pending_next = address + burst_end;
+                        const trailing_offset = burst_end - 1 + width;
+                        const trailing_end = std.math.add(usize, address, trailing_offset) catch return ScannerError.ReadFailed;
+                        writer.pending_end = @max(writer.pending_end, trailing_end);
+                        hit_primary = std.mem.indexOfPos(u8, current, burst_end, needles.primary);
+                        if (hit_secondary) |h2| {
+                            if (h2 < burst_end) {
+                                hit_secondary = std.mem.indexOfPos(u8, current, burst_end, needles.secondary.?);
+                            }
+                        }
+                        continue;
+                    }
                     hit_primary = std.mem.indexOfPos(u8, current, h + 1, needles.primary);
                 } else {
                     hit_secondary = std.mem.indexOfPos(u8, current, h + 1, needles.secondary.?);
@@ -4099,23 +4121,19 @@ test "rescanMatches: fixed integer exact full segment direct search honors rever
     try std.testing.expectEqual(null, scanner.matches.?.findMatchIndexByAddress(base_address + 4));
 }
 
-test "rescanMatches: FLOAT32 exact full segment search keeps both zero signs for negative-zero input" {
+test "rescanMatches: FLOAT32 exact full segment burst keeps both zero signs" {
     const allocator = std.testing.allocator;
 
-    // 12-byte stride-1 candidate window inside a 64 KiB scratch buffer:
-    //   bytes 0..3   : +0.0 (all zero)
-    //   bytes 4..7   : non-zero noise so intermediate windows don't match
-    //   bytes 8..11  : -0.0 (byte 11 = 0x80)
-    // With the negative-zero fix the dual-cursor rescan must emit both
-    // candidate addresses exactly once.
+    // 25 stride-1 candidates inside a 64 KiB scratch buffer:
+    //   offsets 0..12 : +0.0 burst in zero-filled memory
+    //   offsets 17..19: shorter +0.0 burst after the stop byte
+    //   offset 20     : -0.0
+    //   offset 24     : final +0.0
     const buffer = try allocator.alloc(u8, MemoryCache.read_chunk_size);
     defer allocator.free(buffer);
     @memset(buffer, 0);
-    buffer[4] = 0x11;
-    buffer[5] = 0x22;
-    buffer[6] = 0x33;
-    buffer[7] = 0x44;
-    buffer[11] = 0x80;
+    buffer[16] = 0xcc;
+    buffer[23] = 0x80;
 
     var scanner = Scanner.init(allocator, std.testing.io);
     defer scanner.deinit();
@@ -4123,7 +4141,7 @@ test "rescanMatches: FLOAT32 exact full segment search keeps both zero signs for
     try attachScannerToTestMemory(&scanner, allocator, buffer);
 
     const base_address = @intFromPtr(buffer.ptr);
-    const old_values: [12]u8 = @splat(0);
+    const old_values: [25]u8 = @splat(0);
     var matches = try MatchesArray.init(allocator, 256, 1);
     try matches.appendRun(base_address, &old_values, (MatchFlags{ .f32b = true }).bits(), old_values.len);
     try matches.finalize();
@@ -4137,9 +4155,15 @@ test "rescanMatches: FLOAT32 exact full segment search keeps both zero signs for
     try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
 
     try scanner.matches.?.validate();
-    try std.testing.expectEqual(2, scanner.matchCount());
+    try std.testing.expectEqual(18, scanner.matchCount());
     try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
-    try std.testing.expectEqual(base_address + 8, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(base_address + 12, (try scanner.matchAt(12)).address);
+    try std.testing.expectEqual(base_address + 17, (try scanner.matchAt(13)).address);
+    try std.testing.expectEqual(base_address + 20, (try scanner.matchAt(16)).address);
+    try std.testing.expectEqual(base_address + 24, (try scanner.matchAt(17)).address);
+    var stored: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, try scanner.storedMatchBytes(12, &stored));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0x80 }, try scanner.storedMatchBytes(16, &stored));
 }
 
 test "rescanMatches: compare dense batch followed by sparse survivor" {
