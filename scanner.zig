@@ -31,12 +31,7 @@ pub const Region = process.Region;
 pub const ScanLevel = process.ScanLevel;
 pub const ScanDataType = scanroutines.ScanDataType;
 pub const ScanMatchType = scanroutines.ScanMatchType;
-pub const ScanRoutine = scanroutines.ScanRoutine;
-pub const ScanResult = scanroutines.ScanResult;
-pub const SaveInfo = scanroutines.SaveInfo;
 pub const MatchesArray = targetmem.MatchesArray;
-pub const MatchIterator = targetmem.MatchIterator;
-pub const MatchLocation = targetmem.MatchLocation;
 pub const StorageError = targetmem.StorageError;
 pub const UserValue = value_mod.UserValue;
 pub const Value = value_mod.Value;
@@ -54,6 +49,7 @@ pub const ScannerError = error{
     UndoIoFailed,
     UndoCorrupt,
     SnapshotRequiresReset,
+    OptionRequiresReset,
     MatchIndexOutOfRange,
     BufferTooSmall,
     InvalidUserValueCount,
@@ -73,9 +69,9 @@ pub const ScanOptions = struct {
 };
 
 pub const PreparedScan = struct {
-    routine: ScanRoutine,
     match_type: ScanMatchType,
     data_type: ScanDataType,
+    reverse_endianness: bool = false,
 
     pub fn maxMatchLength(self: PreparedScan, user_values: []const UserValue) usize {
         return switch (self.data_type) {
@@ -110,11 +106,6 @@ pub const RegionRecord = struct {
     region: Region,
 };
 
-pub const NumericMatchSnapshot = struct {
-    match: MatchRecord,
-    current_value: Value,
-};
-
 const UndoMetadata = struct {
     num_matches: usize,
     options: ScanOptions,
@@ -124,44 +115,13 @@ const UndoFileHeader = extern struct {
     num_matches: u64,
     used_len: u64,
     max_needed_bytes: u64,
-    tail_swath_offset: u64,
     match_count: u64,
+    stride: u16,
     alignment: u16,
     scan_data_type: u16,
     scan_level: u16,
     reverse_endianness: u8,
-    _padding: [5]u8 = @splat(0),
-
-    fn init(scanner: *const Scanner, matches: *const MatchesArray) UndoFileHeader {
-        return .{
-            .num_matches = scanner.num_matches,
-            .used_len = matches.used_len,
-            .max_needed_bytes = matches.max_needed_bytes,
-            .tail_swath_offset = matches.tail_swath_offset,
-            .match_count = matches.match_count,
-            .alignment = scanner.options.alignment,
-            .scan_data_type = @intFromEnum(scanner.options.scan_data_type),
-            .scan_level = @intFromEnum(scanner.options.scan_level),
-            .reverse_endianness = @intFromBool(scanner.options.reverse_endianness),
-        };
-    }
-
-    fn validate(self: UndoFileHeader) ScannerError!void {
-        if (self.used_len < @sizeOf(targetmem.SwathHeader)) return ScannerError.UndoCorrupt;
-        if (self.tail_swath_offset >= self.used_len) return ScannerError.UndoCorrupt;
-    }
-
-    fn undoMetadata(self: UndoFileHeader) UndoMetadata {
-        return .{
-            .num_matches = @intCast(self.num_matches),
-            .options = .{
-                .alignment = self.alignment,
-                .scan_data_type = @enumFromInt(self.scan_data_type),
-                .scan_level = @enumFromInt(self.scan_level),
-                .reverse_endianness = self.reverse_endianness != 0,
-            },
-        };
-    }
+    _padding: [7]u8 = @splat(0),
 };
 
 pub const Scanner = struct {
@@ -249,12 +209,19 @@ pub const Scanner = struct {
         }
     }
 
-    pub fn setDataType(self: *Scanner, data_type: ScanDataType) void {
+    pub fn setDataType(self: *Scanner, data_type: ScanDataType) ScannerError!void {
+        if (!self.fresh_session) return ScannerError.OptionRequiresReset;
         self.options.scan_data_type = data_type;
     }
 
-    pub fn setReverseEndianness(self: *Scanner, enabled: bool) void {
+    pub fn setReverseEndianness(self: *Scanner, enabled: bool) ScannerError!void {
+        if (!self.fresh_session) return ScannerError.OptionRequiresReset;
         self.options.reverse_endianness = enabled;
+    }
+
+    pub fn setAlignment(self: *Scanner, alignment: u16) ScannerError!void {
+        if (!self.fresh_session) return ScannerError.OptionRequiresReset;
+        self.options.alignment = alignment;
     }
 
     pub fn setStopFlag(self: *Scanner, stop: bool) void {
@@ -299,9 +266,9 @@ pub const Scanner = struct {
         const location = matches.nthMatch(match_index) orelse return ScannerError.MatchIndexOutOfRange;
         return .{
             .index = match_index,
-            .address = location.remoteAddress(&matches),
-            .stored_value = location.value(&matches),
-            .raw_match_info_bits = location.rawMatchInfoBits(&matches),
+            .address = location.address,
+            .stored_value = decodeValueForTargetEndian(self.options.scan_data_type, self.options.reverse_endianness, location.value(&matches)),
+            .raw_match_info_bits = location.raw_match_info_bits,
         };
     }
 
@@ -375,7 +342,8 @@ pub const Scanner = struct {
 
     pub fn ensureMatchStorage(self: *Scanner, max_needed_bytes: usize) ScannerError!*MatchesArray {
         if (self.matches == null) {
-            self.matches = try MatchesArray.init(self.allocator, max_needed_bytes);
+            const stride = effectiveAlignment(self.options.alignment, self.options.scan_data_type);
+            self.matches = try MatchesArray.init(self.allocator, max_needed_bytes, stride);
             self.num_matches = 0;
         }
 
@@ -389,24 +357,49 @@ pub const Scanner = struct {
     ) ScannerError!PreparedScan {
         if (self.process_handle == null) return ScannerError.NotAttached;
         if (self.regions.len == 0) return ScannerError.NoRegions;
-
-        const routine = scanroutines.chooseRoutine(
-            self.options.scan_data_type,
-            match_type,
-            user_values,
-            self.options.reverse_endianness,
-        ) orelse return ScannerError.UnsupportedScanCombination;
+        if (!scanroutines.validateCombo(self.options.scan_data_type, match_type, user_values)) {
+            return ScannerError.UnsupportedScanCombination;
+        }
 
         return .{
-            .routine = routine,
             .match_type = match_type,
             .data_type = self.options.scan_data_type,
+            .reverse_endianness = self.options.reverse_endianness,
         };
     }
 
     pub fn scan(self: *Scanner, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
         if (self.matches == null or self.num_matches == 0) {
             self.clearUndoHistory();
+            // MATCHUPDATE on a fresh session has nothing to refresh.
+            // Previously this fell through to initialScan, which allocated empty match storage only to produce no matches.
+            // Preserve the observable result (0 matches, scanner no longer fresh) without the wasted allocation.
+            // PrepareScan still runs so attachment, regions, and combo validity are checked at the boundary.
+            if (match_type == .MATCHUPDATE) {
+                _ = try self.prepareScan(match_type, user_values);
+                self.fresh_session = false;
+                return;
+            }
+            // Old-value-dependent match types match nothing on a fresh session because there is no prior value to compare against.
+            // Skip the memory walk and large match-storage allocation.
+            // PrepareScan still enforces attachment/regions/combo (including required user values for MATCHINCREASEDBY/MATCHDECREASEDBY).
+            switch (match_type) {
+                .MATCHCHANGED,
+                .MATCHNOTCHANGED,
+                .MATCHINCREASED,
+                .MATCHDECREASED,
+                .MATCHINCREASEDBY,
+                .MATCHDECREASEDBY,
+                => {
+                    _ = try self.prepareScan(match_type, user_values);
+                    self.resetMatches();
+                    self.scan_progress = 1.0;
+                    self.stop_flag = false;
+                    self.fresh_session = false;
+                    return;
+                },
+                else => {},
+            }
             try self.initialScan(match_type, user_values);
             self.fresh_session = false;
         } else {
@@ -480,7 +473,7 @@ pub const Scanner = struct {
 
                     region_offset += scan_advance;
                     processed_bytes += scan_advance;
-                    self.scan_progress = if (total_bytes == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed_bytes)) / @as(f64, @floatFromInt(total_bytes)));
+                    updateProgress(self, processed_bytes, total_bytes);
                 }
 
                 if (self.stop_flag) break;
@@ -527,16 +520,19 @@ pub const Scanner = struct {
         }
     }
 
-    pub fn readOwnedBytes(self: *Scanner, allocator: Allocator, address: usize, len: usize) ScannerError![]u8 {
-        const bytes = allocator.alloc(u8, len) catch return ScannerError.OutOfMemory;
-        errdefer allocator.free(bytes);
-        try self.readBytesExact(address, bytes);
-        return bytes;
-    }
-
     pub fn readMatchBytes(self: *Scanner, match_index: usize, buf: []u8) ScannerError![]const u8 {
         const record = try self.matchAt(match_index);
-        const length = try matchReadLength(self.options.scan_data_type, record.raw_match_info_bits);
+        const length = switch (self.options.scan_data_type) {
+            .BYTEARRAY, .STRING => if (record.raw_match_info_bits == 0)
+                return ScannerError.UnsupportedReadDataType
+            else
+                record.raw_match_info_bits,
+            else => blk: {
+                const numeric_length = flagsToNumericLength(@bitCast(record.raw_match_info_bits));
+                if (numeric_length == 0) return ScannerError.UnsupportedReadDataType;
+                break :blk numeric_length;
+            },
+        };
         if (buf.len < length) return ScannerError.BufferTooSmall;
 
         try self.readBytesExact(record.address, buf[0..length]);
@@ -546,27 +542,21 @@ pub const Scanner = struct {
     pub fn readNumericMatchValue(self: *Scanner, match_index: usize) ScannerError!Value {
         const record = try self.matchAt(match_index);
         const flags = try matchReadFlags(self.options.scan_data_type, record.raw_match_info_bits);
-        return self.readValueWithFlags(record.address, flags);
-    }
+        const length = flagsToNumericLength(flags);
+        if (length == 0) return ScannerError.UnsupportedReadDataType;
 
-    pub fn currentNumericMatchValue(self: *Scanner, match_index: usize) ScannerError!NumericMatchSnapshot {
-        const record = try self.matchAt(match_index);
-        return .{
-            .match = record,
-            .current_value = try self.readNumericMatchValue(match_index),
+        var value = Value{
+            .data = .{ .uint64_value = 0 },
+            .flags = flags,
         };
-    }
-
-    pub fn readOwnedMatchBytes(self: *Scanner, allocator: Allocator, match_index: usize) ScannerError![]u8 {
-        const record = try self.matchAt(match_index);
-        const length = try matchReadLength(self.options.scan_data_type, record.raw_match_info_bits);
-        return self.readOwnedBytes(allocator, record.address, length);
+        try self.readBytesExact(record.address, value.data.bytes[0..length]);
+        return decodeValueForTargetEndian(self.options.scan_data_type, self.options.reverse_endianness, value);
     }
 
     pub fn storedMatchBytes(self: *const Scanner, match_index: usize, buf: []u8) ScannerError![]const u8 {
         const matches = self.matches orelse return ScannerError.NoMatches;
         const location = matches.nthMatch(match_index) orelse return ScannerError.MatchIndexOutOfRange;
-        const length = storedLengthForExistingMatch(self.options.scan_data_type, location.rawMatchInfoBits(&matches));
+        const length = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
         if (length == 0) return ScannerError.UnsupportedReadDataType;
         if (buf.len < length) return ScannerError.BufferTooSmall;
 
@@ -617,7 +607,7 @@ pub const Scanner = struct {
         const expected_length: ?usize = switch (self.options.scan_data_type) {
             .BYTEARRAY, .STRING => storedLengthForExistingMatch(
                 self.options.scan_data_type,
-                location.rawMatchInfoBits(&matches),
+                location.raw_match_info_bits,
             ),
             else => null,
         };
@@ -630,16 +620,22 @@ pub const Scanner = struct {
             expected_length,
             &scratch,
         );
-        try self.writeBytes(location.remoteAddress(&matches), data);
+        try self.writeBytes(location.address, data);
     }
 
     pub fn initialScan(self: *Scanner, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
         const prepared = try self.prepareScan(match_type, user_values);
         const handle = &self.process_handle.?;
         const alignment = effectiveAlignment(self.options.alignment, prepared.data_type);
+        const initial_kernel = scanroutines.pickInitialNumericKernel(prepared.data_type, match_type, self.options.reverse_endianness);
 
         self.resetMatches();
-        const matches = try self.ensureMatchStorage(calculateMaxMatchStorage(self.regions));
+        // Upper bound for dense storage: header + 3 B/byte worst case (stride 1 inline raw_bits).
+        var max_needed_bytes: usize = 0;
+        for (self.regions) |region| {
+            max_needed_bytes += @sizeOf(targetmem.SwathHeader) + region.size * 3;
+        }
+        const matches = try self.ensureMatchStorage(max_needed_bytes);
         errdefer {
             matches.deinit();
             self.matches = null;
@@ -675,6 +671,7 @@ pub const Scanner = struct {
                 try scanChunkIntoMatches(
                     matches,
                     prepared,
+                    initial_kernel,
                     user_values,
                     region.start + region_offset,
                     buffer[0..bytes_read],
@@ -686,7 +683,7 @@ pub const Scanner = struct {
 
                 region_offset += scan_chunk.scan_limit;
                 processed_bytes += scan_chunk.scan_limit;
-                self.scan_progress = if (total_bytes == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed_bytes)) / @as(f64, @floatFromInt(total_bytes)));
+                updateProgress(self, processed_bytes, total_bytes);
 
                 if (scan_chunk.scan_limit == 0) break;
                 if (scan_chunk.stop_region) break;
@@ -701,65 +698,1295 @@ pub const Scanner = struct {
     }
 
     pub fn rescanMatches(self: *Scanner, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        // prepareScan validates attachment, regions, and combo (including the STRING/BYTEARRAY length cap in validateCombo)
+        // before any scanner-side intercept.
         const prepared = try self.prepareScan(match_type, user_values);
+
+        if (match_type == .MATCHUPDATE) return self.rescanUpdate();
+        if (match_type == .MATCHANY) return self.rescanMatchAny(prepared.data_type);
+        if (prepared.data_type == .STRING and match_type == .MATCHEQUALTO) {
+            return self.rescanStringEqualTo(user_values[0].string_value.?);
+        }
+        if (prepared.data_type == .BYTEARRAY and match_type == .MATCHEQUALTO) {
+            return self.rescanByteArrayEqualTo(user_values[0].bytearray_value.?, user_values[0].wildcard_value.?);
+        }
+
+        // STRING/BYTEARRAY were intercepted above (validateCombo only admits MATCHANY/MATCHEQUALTO/MATCHUPDATE for them),
+        // so anything still here is numeric with a fixed width.
+        // CHANGED/NOTCHANGED operate purely on byte equality, so the integer fast paths handle floats unchanged.
+        // Delta paths pre-select a kernel via "pickFixedDeltaKernel" that branches on data_type/match_type/endian at comptime.
+        // ANY-types use width = 8 (max read), where the kernel evaluates every sub-width that fits
+        // and the per-location path slices per the candidate's stored width.
+        const width: usize = switch (prepared.data_type) {
+            .INTEGER8 => 1,
+            .INTEGER16 => 2,
+            .INTEGER32, .FLOAT32 => 4,
+            .INTEGER64, .FLOAT64 => 8,
+            .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => 8,
+            .BYTEARRAY, .STRING => unreachable,
+        };
+        switch (match_type) {
+            .MATCHEQUALTO,
+            .MATCHNOTEQUALTO,
+            .MATCHGREATERTHAN,
+            .MATCHLESSTHAN,
+            .MATCHRANGE,
+            => return self.rescanFixedWidthCompare(width, match_type, user_values),
+            .MATCHCHANGED => return self.rescanFixedWidthChanged(width),
+            .MATCHNOTCHANGED => return self.rescanFixedWidthNotChanged(width),
+            .MATCHINCREASED,
+            .MATCHDECREASED,
+            .MATCHINCREASEDBY,
+            .MATCHDECREASEDBY,
+            => return self.rescanFixedWidthDelta(width, match_type, user_values),
+            .MATCHANY, .MATCHUPDATE => unreachable, // intercepted above
+        }
+    }
+
+    fn rescanUpdate(self: *Scanner) ScannerError!void {
         const handle = &self.process_handle.?;
         if (self.matches == null) return ScannerError.NoMatches;
-        const matches = &self.matches.?;
-
-        const byte_count = matches.storedByteCount();
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
 
         self.num_matches = 0;
         self.scan_progress = 0;
         self.stop_flag = false;
 
-        var iterator = matches.storedByteIterator();
-        matches.beginInPlaceRewrite();
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
 
+        var iterator = old_matches.iterator();
         var processed: usize = 0;
-        var required_extra_bytes: usize = 0;
         var cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &cache,
+        };
 
-        while (iterator.next()) |stored| {
+        while (iterator.next()) |location| {
             if (self.stop_flag) break;
-            defer {
-                processed += 1;
-                self.scan_progress = if (byte_count == 0) 1.0 else @min(1.0, @as(f64, @floatFromInt(processed)) / @as(f64, @floatFromInt(byte_count)));
-            }
 
-            if (stored.isMatch()) {
-                const old_length = storedLengthForExistingMatch(prepared.data_type, stored.raw_match_info_bits);
-                if (old_length > 0) {
-                    const memory = cache.peek(handle, stored.address, old_length) catch {
-                        required_extra_bytes = 0;
-                        continue;
-                    };
-                    const old_value = stored.value(matches);
-                    const result = prepared.routine(memory, &old_value, user_values);
-
-                    if (result.matched_len > 0) {
-                        const raw_bits = result.save.raw();
-                        if (raw_bits != 0) {
-                            try matches.appendInPlaceRewrite(stored.address, memory[0], @bitCast(raw_bits));
-                            self.num_matches += 1;
-                        }
-                        required_extra_bytes = result.matched_len - 1;
-                    } else if (required_extra_bytes > 0) {
-                        try matches.appendInPlaceRewrite(stored.address, memory[0], .{});
-                        required_extra_bytes -= 1;
-                    }
-                }
-            } else if (required_extra_bytes > 0) {
-                const memory = cache.peek(handle, stored.address, 1) catch {
-                    required_extra_bytes = 0;
+            const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
+            if (stored_len != 0) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed += 1;
+                    updateRescanProgress(self, processed, total_matches);
                     continue;
                 };
-                try matches.appendInPlaceRewrite(stored.address, memory[0], .{});
-                required_extra_bytes -= 1;
+                if (memory.len >= stored_len) {
+                    try writer.appendMatch(location.address, memory[0], stored_len, location.raw_match_info_bits);
+                    self.num_matches += 1;
+                }
+            }
+
+            processed += 1;
+            updateRescanProgress(self, processed, total_matches);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanMatchAny(self: *Scanner, data_type: ScanDataType) ScannerError!void {
+        // MATCHANY revisits existing match addresses only and never discovers new ones.
+        // For fixed concrete types it refreshes the current bytes and reasserts the type's flag.
+        // For ANY-types it re-broadens to every width that fits the previously-stored length.
+        // For STRING/BYTEARRAY it preserves the stored variable length.
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var iterator = old_matches.iterator();
+        var processed: usize = 0;
+        var cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &cache,
+        };
+
+        while (iterator.next()) |location| {
+            if (self.stop_flag) break;
+
+            const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
+            if (stored_len != 0) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed += 1;
+                    updateRescanProgress(self, processed, total_matches);
+                    continue;
+                };
+                if (memory.len >= stored_len) {
+                    const new_raw_bits = matchAnyRawBitsForStoredLength(data_type, stored_len);
+                    if (new_raw_bits != 0) {
+                        try writer.appendMatch(location.address, memory[0], stored_len, new_raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
+            }
+
+            processed += 1;
+            updateRescanProgress(self, processed, total_matches);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanStringEqualTo(self: *Scanner, needle: []const u8) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        if (needle.len != 0) {
+            // Length fits in u16: validateCombo gated "needle.len <= maxInt(u16)".
+            const raw_len: u16 = @intCast(needle.len);
+            var iterator = old_matches.iterator();
+            var processed: usize = 0;
+            var cache = MemoryCache{};
+            var writer = RescanSpanWriter{
+                .matches = &new_matches,
+                .handle = handle,
+                .cache = &cache,
+            };
+
+            while (iterator.next()) |location| {
+                if (self.stop_flag) break;
+
+                const old_len = storedLengthForExistingMatch(.STRING, location.raw_match_info_bits);
+                if (old_len >= needle.len) {
+                    // Preserve rescan semantics: read the previously stored length, so a longer new needle cannot
+                    // match an older shorter string at the same address.
+                    const memory = cache.peek(handle, location.address, old_len) catch {
+                        processed += 1;
+                        updateRescanProgress(self, processed, total_matches);
+                        continue;
+                    };
+                    if (memory.len >= old_len and std.mem.eql(u8, memory[0..needle.len], needle)) {
+                        try writer.appendMatch(location.address, memory[0], needle.len, raw_len);
+                        self.num_matches += 1;
+                    }
+                }
+
+                processed += 1;
+                updateRescanProgress(self, processed, total_matches);
+            }
+
+            try writer.flushBefore(std.math.maxInt(usize));
+        }
+
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanByteArrayEqualTo(self: *Scanner, pattern: []const u8, wildcards: []const value_mod.Wildcard) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        if (pattern.len != 0 and pattern.len == wildcards.len) {
+            // Length fits in u16: validateCombo gated "pattern.len <= maxInt(u16)".
+            const raw_len: u16 = @intCast(pattern.len);
+            var iterator = old_matches.iterator();
+            var processed: usize = 0;
+            var cache = MemoryCache{};
+            var writer = RescanSpanWriter{
+                .matches = &new_matches,
+                .handle = handle,
+                .cache = &cache,
+            };
+
+            while (iterator.next()) |location| {
+                if (self.stop_flag) break;
+
+                const old_len = storedLengthForExistingMatch(.BYTEARRAY, location.raw_match_info_bits);
+                if (old_len >= pattern.len) {
+                    const memory = cache.peek(handle, location.address, old_len) catch {
+                        processed += 1;
+                        updateRescanProgress(self, processed, total_matches);
+                        continue;
+                    };
+                    if (memory.len >= old_len and bytearrayMatches(memory[0..pattern.len], pattern, wildcards)) {
+                        try writer.appendMatch(location.address, memory[0], pattern.len, raw_len);
+                        self.num_matches += 1;
+                    }
+                }
+
+                processed += 1;
+                updateRescanProgress(self, processed, total_matches);
+            }
+
+            try writer.flushBefore(std.math.maxInt(usize));
+        }
+
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthCompare(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        if (old_matches.stride == 1) return self.rescanFixedWidthCompareStrideOne(width, match_type, user_values);
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var read_cache = MemoryCache{};
+        var write_cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &write_cache,
+        };
+
+        var processed: usize = 0;
+        // Pre-select the concrete compare kernel once per pass.
+        // All runtime dispatch on data_type / match_type / endian collapses here,
+        // leaving the per-candidate hot loop with a direct function-pointer call.
+        const kernel = scanroutines.pickFixedCompareKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
+        // Predicate reads current process bytes + user values only, never reads old_matches storage behind the cursor.
+        // Safe to release consumed segments mid-pass, mirroring the stride-1 compare rebuild path.
+        var segments = old_matches.segmentIterator();
+        while (segments.next()) |segment| {
+            if (self.stop_flag) break;
+            try self.rescanCompareSegmentFallbackFrom(old_matches, segment, 0, width, kernel, user_values, &read_cache, &writer, &processed, total_matches);
+            old_matches.releaseStorageBefore(segment.end_offset);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthChanged(self: *Scanner, width: usize) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        if (old_matches.stride == 1) return self.rescanFixedWidthChangedStrideOne(width);
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var iterator = old_matches.iterator();
+        var processed: usize = 0;
+        var cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &cache,
+        };
+        var old_bytes: [8]u8 = undefined;
+
+        while (iterator.next()) |location| {
+            if (self.stop_flag) break;
+
+            // For fixed-width types stored_len == width.
+            // For ANY-types it is the candidate's per-flag width (1/2/4/8).
+            // Read exactly the stored bytes and preserve the existing raw_bits
+            // since CHANGED never narrows flags.
+            const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
+            if (stored_len != 0 and stored_len <= width) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed += 1;
+                    updateRescanProgress(self, processed, total_matches);
+                    continue;
+                };
+                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                // Short stored reads mean we cannot prove the value changed.
+                if (old.len == stored_len and memory.len >= stored_len and !std.mem.eql(u8, memory[0..stored_len], old)) {
+                    try writer.appendMatch(location.address, memory[0], stored_len, location.raw_match_info_bits);
+                    self.num_matches += 1;
+                }
+            }
+
+            processed += 1;
+            updateRescanProgress(self, processed, total_matches);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthDelta(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const old_matches = &self.matches.?;
+        if (old_matches.stride == 1) return self.rescanFixedWidthDeltaStrideOne(width, match_type, user_values);
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var iterator = old_matches.iterator();
+        var processed: usize = 0;
+        var cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &cache,
+        };
+        var old_bytes: [8]u8 = undefined;
+        // Pre-select the concrete delta kernel once per pass so the per-location hot loop only does a direct function-pointer call.
+        const kernel = scanroutines.pickFixedDeltaKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
+
+        while (iterator.next()) |location| {
+            if (self.stop_flag) break;
+
+            const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
+            if (stored_len != 0 and stored_len <= width) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed += 1;
+                    updateRescanProgress(self, processed, total_matches);
+                    continue;
+                };
+                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                if (old.len == stored_len and memory.len >= stored_len) {
+                    const raw_bits = kernel(memory[0..stored_len], old, location.raw_match_info_bits, user_values);
+                    if (raw_bits != 0) {
+                        const matched_len = flagsToNumericLength(@bitCast(raw_bits));
+                        try writer.appendMatch(location.address, memory[0], matched_len, raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
+            }
+
+            processed += 1;
+            updateRescanProgress(self, processed, total_matches);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthCompareStrideOne(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var read_cache = MemoryCache{};
+        var write_cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &write_cache,
+        };
+        const raw_bits_scratch = try self.allocator.alloc(u16, MemoryCache.read_chunk_size);
+        defer self.allocator.free(raw_bits_scratch);
+
+        var processed: usize = 0;
+        // Pre-select the concrete compare kernel once per pass.
+        // All runtime dispatch on data_type / match_type / endian collapses here,
+        // leaving the per-candidate hot loop with a direct function-pointer call.
+        const kernel = scanroutines.pickFixedCompareKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
+        // For fixed concrete numeric MATCHEQUALTO over a full-shared stride-1 segment
+        // we can replace the per-candidate kernel call with a direct byte search against pre-serialized needle(s).
+        // "fullSharedStrideOneWidth" guarantees the segment is the entire old candidate set, so every hit is in-bounds.
+        // Reused across segments, serialize once.
+        var primary_buf: [8]u8 = undefined;
+        var secondary_buf: [8]u8 = undefined;
+        const exact_needles: ?ExactNumericNeedles = if (match_type == .MATCHEQUALTO and user_values.len > 0)
+            serializeExactNumericNeedles(self.options.scan_data_type, user_values[0], self.options.reverse_endianness, &primary_buf, &secondary_buf)
+        else
+            null;
+        var segments = old_matches.segmentIterator();
+        while (segments.next()) |segment| {
+            if (self.stop_flag) break;
+            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+                if (exact_needles) |needles| {
+                    try self.rescanExactFullSegment(old_matches, segment, segment_width, needles, kernel, user_values, &read_cache, &writer, &processed, total_matches);
+                } else {
+                    try self.rescanCompareFullSegment(old_matches, segment, segment_width, kernel, user_values, &read_cache, &writer, raw_bits_scratch, &processed, total_matches);
+                }
+            } else {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, 0, width, kernel, user_values, &read_cache, &writer, &processed, total_matches);
+            }
+            old_matches.releaseStorageBefore(segment.end_offset);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthChangedStrideOne(self: *Scanner, width: usize) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var read_cache = MemoryCache{};
+        var write_cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &write_cache,
+        };
+        var processed: usize = 0;
+        var segments = old_matches.segmentIterator();
+        while (segments.next()) |segment| {
+            if (self.stop_flag) break;
+            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+                const raw_bits = segment.header.shared_raw_bits;
+                try self.rescanChangedFullSegment(old_matches, segment, segment_width, raw_bits, &read_cache, &writer, &processed, total_matches);
+            } else {
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, 0, width, &read_cache, &writer, &processed, total_matches);
+            }
+            old_matches.releaseStorageBefore(segment.end_offset);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthDeltaStrideOne(self: *Scanner, width: usize, match_type: ScanMatchType, user_values: []const UserValue) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const old_matches = &self.matches.?;
+        const total_matches = old_matches.matchCount();
+
+        self.num_matches = 0;
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
+        errdefer new_matches.deinit();
+
+        var read_cache = MemoryCache{};
+        var write_cache = MemoryCache{};
+        var writer = RescanSpanWriter{
+            .matches = &new_matches,
+            .handle = handle,
+            .cache = &write_cache,
+        };
+        const raw_bits_scratch = try self.allocator.alloc(u16, MemoryCache.read_chunk_size);
+        defer self.allocator.free(raw_bits_scratch);
+
+        var processed: usize = 0;
+        // Pre-select the concrete delta kernel once per pass so the per-candidate hot loop only does a direct function-pointer call.
+        const kernel = scanroutines.pickFixedDeltaKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
+        var segments = old_matches.segmentIterator();
+        while (segments.next()) |segment| {
+            if (self.stop_flag) break;
+            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+                const raw_bits = segment.header.shared_raw_bits;
+                try self.rescanDeltaFullSegment(old_matches, segment, segment_width, raw_bits, kernel, match_type, user_values, &read_cache, &writer, raw_bits_scratch, &processed, total_matches);
+            } else {
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, 0, width, kernel, user_values, &read_cache, &writer, &processed, total_matches);
+            }
+            old_matches.releaseStorageBefore(segment.end_offset);
+        }
+
+        try writer.flushBefore(std.math.maxInt(usize));
+        try new_matches.finalize();
+
+        var to_free = self.matches.?;
+        self.matches = new_matches;
+        to_free.deinit();
+
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthNotChanged(self: *Scanner, width: usize) ScannerError!void {
+        const handle = &self.process_handle.?;
+        if (self.matches == null) return ScannerError.NoMatches;
+        const matches = &self.matches.?;
+        if (matches.stride == 1) return self.rescanFixedWidthNotChangedStrideOne(width);
+        const total_matches = matches.matchCount();
+
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var iterator = matches.iterator();
+        var processed: usize = 0;
+        var cache = MemoryCache{};
+        var old_bytes: [8]u8 = undefined;
+
+        while (iterator.next()) |location| {
+            if (self.stop_flag) break;
+
+            const keep = keep: {
+                const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
+                if (stored_len == 0 or stored_len > width) break :keep false;
+                const memory = cache.peek(handle, location.address, stored_len) catch break :keep false;
+                const old = matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                break :keep old.len == stored_len and memory.len >= stored_len and std.mem.eql(u8, memory[0..stored_len], old);
+            };
+            // The iterator has already advanced past this match.
+            // Removing the current result cannot invalidate its future-position caches.
+            if (!keep) matches.removeMatch(location);
+
+            processed += 1;
+            updateRescanProgress(self, processed, total_matches);
+        }
+
+        self.num_matches = matches.matchCount();
+        self.scan_progress = 1.0;
+    }
+
+    fn rescanFixedWidthNotChangedStrideOne(self: *Scanner, width: usize) ScannerError!void {
+        const matches = &self.matches.?;
+        const total_matches = matches.matchCount();
+
+        self.scan_progress = 0;
+        self.stop_flag = false;
+
+        var cache = MemoryCache{};
+        var processed: usize = 0;
+        var segments = matches.segmentIterator();
+        while (segments.next()) |segment| {
+            if (self.stop_flag) break;
+            if (fullSharedStrideOneWidth(segment, self.options.scan_data_type, width)) |segment_width| {
+                const raw_bits = segment.header.shared_raw_bits;
+                self.rescanNotChangedFullSegment(matches, segment, segment_width, raw_bits, &cache, &processed, total_matches);
+            } else {
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, 0, width, &cache, &processed, total_matches);
             }
         }
 
-        try matches.finalize();
+        self.num_matches = matches.matchCount();
         self.scan_progress = 1.0;
+    }
+
+    fn rescanCompareFullSegment(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        width: usize,
+        kernel: scanroutines.FixedCompareKernel,
+        user_values: []const UserValue,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        raw_bits_scratch: []u16,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        var candidate: usize = 0;
+        while (candidate < segment.candidate_count) {
+            if (self.stop_flag) break;
+
+            const batch_len = @min(segment.candidate_count - candidate, MemoryCache.read_chunk_size - width + 1);
+            const window_len = batch_len + width - 1;
+            const address = segment.first_candidate + candidate;
+            const current = cache.peek(handle, address, window_len) catch {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            };
+            const valid = if (current.len >= width) @min(batch_len, current.len - width + 1) else 0;
+            if (valid == 0) {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+
+            var survivor_count: usize = 0;
+            for (0..valid) |i| {
+                const raw_bits = kernel(current[i .. i + width], user_values);
+                raw_bits_scratch[i] = raw_bits;
+                if (raw_bits != 0) {
+                    survivor_count += 1;
+                }
+            }
+
+            if (survivor_count * 4 >= valid) {
+                const trailing_end = std.math.add(usize, address, valid + width - 1) catch return ScannerError.ReadFailed;
+                try writer.appendBatch(address, current[0..valid], raw_bits_scratch[0..valid], trailing_end);
+                self.num_matches += survivor_count;
+            } else {
+                for (raw_bits_scratch[0..valid], 0..) |raw_bits, i| {
+                    if (raw_bits == 0) continue;
+                    const matched_len = flagsToNumericLength(@bitCast(raw_bits));
+                    try writer.appendMatch(address + i, current[i], matched_len, raw_bits);
+                    self.num_matches += 1;
+                }
+            }
+
+            candidate += valid;
+            processed.* += valid;
+            updateRescanProgress(self, processed.*, total_matches);
+            if (valid < batch_len) {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+        }
+    }
+
+    /// Fixed concrete numeric MATCHEQUALTO over a full-shared stride-1 segment.
+    /// Searches the segment's current bytes with "std.mem.indexOfPos" against pre-serialized needle(s)
+    /// instead of running the compare kernel at every candidate.
+    /// Safe because `fullSharedStrideOneWidth` guarantees every position in "[first_candidate, first_candidate + candidate_count)"
+    /// was a candidate in the prior match set, so no risk of discovering addresses outside it.
+    /// Read failures fall back to the iterator path (which uses "kernel") so partial reads still respect the old candidate set.
+    fn rescanExactFullSegment(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        width: usize,
+        needles: ExactNumericNeedles,
+        kernel: scanroutines.FixedCompareKernel,
+        user_values: []const UserValue,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        var candidate: usize = 0;
+        while (candidate < segment.candidate_count) {
+            if (self.stop_flag) break;
+
+            const batch_len = @min(segment.candidate_count - candidate, MemoryCache.read_chunk_size - width + 1);
+            const window_len = batch_len + width - 1;
+            const address = segment.first_candidate + candidate;
+            const current = cache.peek(handle, address, window_len) catch {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            };
+            const valid = if (current.len >= width) @min(batch_len, current.len - width + 1) else 0;
+            if (valid == 0) {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+
+            var hit_primary = std.mem.indexOfPos(u8, current, 0, needles.primary);
+            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.indexOfPos(u8, current, 0, sec) else null;
+
+            while (true) {
+                var h: usize = undefined;
+                var consumed_primary: bool = undefined;
+                if (hit_primary) |h1| {
+                    if (hit_secondary) |h2| {
+                        if (h1 <= h2) {
+                            h = h1;
+                            consumed_primary = true;
+                        } else {
+                            h = h2;
+                            consumed_primary = false;
+                        }
+                    } else {
+                        h = h1;
+                        consumed_primary = true;
+                    }
+                } else if (hit_secondary) |h2| {
+                    h = h2;
+                    consumed_primary = false;
+                } else break;
+                if (h >= valid) break;
+                if (consumed_primary) {
+                    hit_primary = std.mem.indexOfPos(u8, current, h + 1, needles.primary);
+                } else {
+                    hit_secondary = std.mem.indexOfPos(u8, current, h + 1, needles.secondary.?);
+                }
+
+                try writer.appendMatch(address + h, current[h], width, needles.raw_bits);
+                self.num_matches += 1;
+            }
+
+            candidate += valid;
+            processed.* += valid;
+            updateRescanProgress(self, processed.*, total_matches);
+            if (valid < batch_len) {
+                try self.rescanCompareSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+        }
+    }
+
+    fn rescanCompareSegmentFallbackFrom(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        start_index: usize,
+        width: usize,
+        kernel: scanroutines.FixedCompareKernel,
+        user_values: []const UserValue,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const data_type = self.options.scan_data_type;
+        var iterator = old_matches.iteratorFrom(segment.swath_offset);
+        while (iterator.next()) |location| {
+            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (location.index < start_index) continue;
+
+            // For fixed-width data types stored_len == width always.
+            // For ANY-types it is the candidate's per-flag width (1/2/4/8).
+            // The kernel reads only as many bytes as were originally stored, and the new matched_len is
+            // derived from the surviving flags so dense storage stays compact.
+            const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
+            if (stored_len != 0 and stored_len <= width) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed.* += 1;
+                    updateRescanProgress(self, processed.*, total_matches);
+                    continue;
+                };
+                if (memory.len >= stored_len) {
+                    const raw_bits = kernel(memory[0..stored_len], user_values);
+                    if (raw_bits != 0) {
+                        const matched_len = flagsToNumericLength(@bitCast(raw_bits));
+                        try writer.appendMatch(location.address, memory[0], matched_len, raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
+            }
+
+            processed.* += 1;
+            updateRescanProgress(self, processed.*, total_matches);
+        }
+    }
+
+    fn rescanChangedFullSegment(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        width: usize,
+        raw_bits: u16,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
+        var candidate: usize = 0;
+        while (candidate < segment.candidate_count) {
+            if (self.stop_flag) break;
+
+            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
+            const window_len = batch_len + width - 1;
+            const address = segment.first_candidate + candidate;
+            const old = old_matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
+            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            if (valid == 0) {
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                return;
+            }
+
+            const valid_window_len = valid + width - 1;
+            const current = cache.peek(handle, address, valid_window_len) catch {
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                return;
+            };
+
+            if (!std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
+                var diff_count: usize = 0;
+                for (0..width) |i| {
+                    if (current[i] != old[i]) diff_count += 1;
+                }
+                for (0..valid) |i| {
+                    if (diff_count != 0) {
+                        try writer.appendMatch(address + i, current[i], width, raw_bits);
+                        self.num_matches += 1;
+                    }
+                    if (i + width < valid_window_len) {
+                        if (current[i] != old[i]) diff_count -= 1;
+                        if (current[i + width] != old[i + width]) diff_count += 1;
+                    }
+                }
+            }
+
+            candidate += valid;
+            processed.* += valid;
+            updateRescanProgress(self, processed.*, total_matches);
+            if (valid < batch_len) {
+                try self.rescanChangedSegmentFallbackFrom(old_matches, segment, candidate, width, cache, writer, processed, total_matches);
+                return;
+            }
+        }
+    }
+
+    fn rescanChangedSegmentFallbackFrom(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        start_index: usize,
+        width: usize,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const data_type = self.options.scan_data_type;
+        var old_bytes: [8]u8 = undefined;
+        var iterator = old_matches.iteratorFrom(segment.swath_offset);
+        while (iterator.next()) |location| {
+            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (location.index < start_index) continue;
+
+            // For fixed-width types stored_len == width.
+            // For ANY-types it is the candidate's per-flag width.
+            // CHANGED never narrows flags so raw_bits and stored width carry through.
+            const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
+            if (stored_len != 0 and stored_len <= width) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed.* += 1;
+                    updateRescanProgress(self, processed.*, total_matches);
+                    continue;
+                };
+                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                if (old.len == stored_len and memory.len >= stored_len and !std.mem.eql(u8, memory[0..stored_len], old)) {
+                    try writer.appendMatch(location.address, memory[0], stored_len, location.raw_match_info_bits);
+                    self.num_matches += 1;
+                }
+            }
+
+            processed.* += 1;
+            updateRescanProgress(self, processed.*, total_matches);
+        }
+    }
+
+    fn rescanDeltaFullSegment(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        width: usize,
+        raw_bits: u16,
+        kernel: scanroutines.FixedDeltaKernel,
+        match_type: ScanMatchType,
+        user_values: []const UserValue,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        raw_bits_scratch: []u16,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const any_number_full = self.options.scan_data_type == .ANYNUMBER and width == 8;
+        const split_float_windows = (self.options.scan_data_type == .ANYFLOAT or any_number_full) and width == 8;
+        const i8_raw_bits = if (any_number_full) raw_bits & MatchFlags.i8b.bits() else 0;
+        const i16_raw_bits = if (any_number_full) raw_bits & MatchFlags.i16b.bits() else 0;
+        const i32_raw_bits = if (any_number_full) raw_bits & MatchFlags.i32b.bits() else 0;
+        const i64_raw_bits = if (any_number_full) raw_bits & MatchFlags.i64b.bits() else 0;
+        const f32_raw_bits = if (split_float_windows) raw_bits & (MatchFlags{ .f32b = true }).bits() else 0;
+        const f64_raw_bits = if (split_float_windows) raw_bits & (MatchFlags{ .f64b = true }).bits() else 0;
+        const i8_kernel = if (any_number_full)
+            scanroutines.pickFixedDeltaKernel(.INTEGER8, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        const i16_kernel = if (any_number_full)
+            scanroutines.pickFixedDeltaKernel(.INTEGER16, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        const i32_kernel = if (any_number_full)
+            scanroutines.pickFixedDeltaKernel(.INTEGER32, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        const i64_kernel = if (any_number_full)
+            scanroutines.pickFixedDeltaKernel(.INTEGER64, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        const f32_kernel = if (split_float_windows)
+            scanroutines.pickFixedDeltaKernel(.FLOAT32, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        const f64_kernel = if (split_float_windows)
+            scanroutines.pickFixedDeltaKernel(.FLOAT64, match_type, self.options.reverse_endianness)
+        else
+            undefined;
+        var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
+        var candidate: usize = 0;
+        while (candidate < segment.candidate_count) {
+            if (self.stop_flag) break;
+
+            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
+            const window_len = batch_len + width - 1;
+            const address = segment.first_candidate + candidate;
+            const old = old_matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
+            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            if (valid == 0) {
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+
+            const valid_window_len = valid + width - 1;
+            const current = cache.peek(handle, address, valid_window_len) catch {
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            };
+
+            // Candidates whose value-width window is byte-identical to the stored bytes cannot have increased or decreased
+            // (true for both int and float, including NaN: identical bits -> identical value or both NaN, neither > nor <).
+            // Gate the per-candidate delta computation on the sliding diff_count window so we only pay for the kernel on actually-changed windows.
+            var survivor_count: usize = 0;
+            if (!std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
+                if (any_number_full) {
+                    var diff_count1: usize = 0;
+                    var diff_count2: usize = 0;
+                    var diff_count4: usize = 0;
+                    var diff_count8: usize = 0;
+                    for (0..8) |i| {
+                        if (current[i] != old[i]) {
+                            diff_count8 += 1;
+                            if (i < 4) diff_count4 += 1;
+                            if (i < 2) diff_count2 += 1;
+                            if (i == 0) diff_count1 += 1;
+                        }
+                    }
+                    for (0..valid) |i| {
+                        raw_bits_scratch[i] = 0;
+                        var new_raw_bits: u16 = 0;
+                        if (diff_count1 != 0 and i8_raw_bits != 0) {
+                            new_raw_bits |= i8_kernel(current[i .. i + 1], old[i .. i + 1], i8_raw_bits, user_values);
+                        }
+                        if (diff_count2 != 0 and i16_raw_bits != 0) {
+                            new_raw_bits |= i16_kernel(current[i .. i + 2], old[i .. i + 2], i16_raw_bits, user_values);
+                        }
+                        if (diff_count4 != 0) {
+                            if (i32_raw_bits != 0) {
+                                new_raw_bits |= i32_kernel(current[i .. i + 4], old[i .. i + 4], i32_raw_bits, user_values);
+                            }
+                            if (f32_raw_bits != 0) {
+                                new_raw_bits |= f32_kernel(current[i .. i + 4], old[i .. i + 4], f32_raw_bits, user_values);
+                            }
+                        }
+                        if (diff_count8 != 0) {
+                            if (i64_raw_bits != 0) {
+                                new_raw_bits |= i64_kernel(current[i .. i + 8], old[i .. i + 8], i64_raw_bits, user_values);
+                            }
+                            if (f64_raw_bits != 0) {
+                                new_raw_bits |= f64_kernel(current[i .. i + 8], old[i .. i + 8], f64_raw_bits, user_values);
+                            }
+                        }
+                        if (new_raw_bits != 0) {
+                            raw_bits_scratch[i] = new_raw_bits;
+                            survivor_count += 1;
+                        }
+                        if (i + 1 < valid) {
+                            if (current[i] != old[i]) {
+                                diff_count1 -= 1;
+                                diff_count2 -= 1;
+                                diff_count4 -= 1;
+                                diff_count8 -= 1;
+                            }
+                            if (current[i + 1] != old[i + 1]) diff_count1 += 1;
+                            if (current[i + 2] != old[i + 2]) diff_count2 += 1;
+                            if (current[i + 4] != old[i + 4]) diff_count4 += 1;
+                            if (current[i + 8] != old[i + 8]) diff_count8 += 1;
+                        }
+                    }
+                } else if (split_float_windows) {
+                    var diff_count_f32: usize = 0;
+                    var diff_count_f64: usize = 0;
+                    for (0..8) |i| {
+                        if (current[i] != old[i]) {
+                            diff_count_f64 += 1;
+                            if (i < 4) diff_count_f32 += 1;
+                        }
+                    }
+                    for (0..valid) |i| {
+                        raw_bits_scratch[i] = 0;
+                        var new_raw_bits: u16 = 0;
+                        if (diff_count_f32 != 0 and f32_raw_bits != 0) {
+                            new_raw_bits |= f32_kernel(current[i .. i + 4], old[i .. i + 4], f32_raw_bits, user_values);
+                        }
+                        if (diff_count_f64 != 0 and f64_raw_bits != 0) {
+                            new_raw_bits |= f64_kernel(current[i .. i + 8], old[i .. i + 8], f64_raw_bits, user_values);
+                        }
+                        if (new_raw_bits != 0) {
+                            raw_bits_scratch[i] = new_raw_bits;
+                            survivor_count += 1;
+                        }
+                        if (i + 1 < valid) {
+                            if (current[i] != old[i]) {
+                                diff_count_f32 -= 1;
+                                diff_count_f64 -= 1;
+                            }
+                            if (current[i + 4] != old[i + 4]) diff_count_f32 += 1;
+                            if (current[i + 8] != old[i + 8]) diff_count_f64 += 1;
+                        }
+                    }
+                } else {
+                    var diff_count: usize = 0;
+                    for (0..width) |i| {
+                        if (current[i] != old[i]) diff_count += 1;
+                    }
+                    for (0..valid) |i| {
+                        raw_bits_scratch[i] = 0;
+                        if (diff_count != 0) {
+                            const new_raw_bits = kernel(current[i .. i + width], old[i .. i + width], raw_bits, user_values);
+                            if (new_raw_bits != 0) {
+                                raw_bits_scratch[i] = new_raw_bits;
+                                survivor_count += 1;
+                            }
+                        }
+                        if (i + width < valid_window_len) {
+                            if (current[i] != old[i]) diff_count -= 1;
+                            if (current[i + width] != old[i + width]) diff_count += 1;
+                        }
+                    }
+                }
+            }
+            if (survivor_count * 4 >= valid) {
+                const trailing_end = std.math.add(usize, address, valid_window_len) catch return ScannerError.ReadFailed;
+                try writer.appendBatch(address, current[0..valid], raw_bits_scratch[0..valid], trailing_end);
+                self.num_matches += survivor_count;
+            } else if (survivor_count != 0) {
+                for (raw_bits_scratch[0..valid], 0..) |new_raw_bits, i| {
+                    if (new_raw_bits == 0) continue;
+                    const matched_len = flagsToNumericLength(@bitCast(new_raw_bits));
+                    try writer.appendMatch(address + i, current[i], matched_len, new_raw_bits);
+                    self.num_matches += 1;
+                }
+            }
+
+            candidate += valid;
+            processed.* += valid;
+            updateRescanProgress(self, processed.*, total_matches);
+            if (valid < batch_len) {
+                try self.rescanDeltaSegmentFallbackFrom(old_matches, segment, candidate, width, kernel, user_values, cache, writer, processed, total_matches);
+                return;
+            }
+        }
+    }
+
+    fn rescanDeltaSegmentFallbackFrom(
+        self: *Scanner,
+        old_matches: *const MatchesArray,
+        segment: targetmem.SegmentView,
+        start_index: usize,
+        width: usize,
+        kernel: scanroutines.FixedDeltaKernel,
+        user_values: []const UserValue,
+        cache: *MemoryCache,
+        writer: *RescanSpanWriter,
+        processed: *usize,
+        total_matches: usize,
+    ) ScannerError!void {
+        const handle = &self.process_handle.?;
+        const data_type = self.options.scan_data_type;
+        var old_bytes: [8]u8 = undefined;
+        var iterator = old_matches.iteratorFrom(segment.swath_offset);
+        while (iterator.next()) |location| {
+            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (location.index < start_index) continue;
+
+            // For fixed-width types stored_len == width.
+            // For ANY-types it is the candidate's per-flag width.
+            // The kernel reads only the stored bytes, and the new matched_len is derived from the
+            // surviving flags so dense storage stays compact.
+            const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
+            if (stored_len != 0 and stored_len <= width) {
+                const memory = cache.peek(handle, location.address, stored_len) catch {
+                    processed.* += 1;
+                    updateRescanProgress(self, processed.*, total_matches);
+                    continue;
+                };
+                const old = old_matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                if (old.len == stored_len and memory.len >= stored_len) {
+                    const raw_bits = kernel(memory[0..stored_len], old, location.raw_match_info_bits, user_values);
+                    if (raw_bits != 0) {
+                        const matched_len = flagsToNumericLength(@bitCast(raw_bits));
+                        try writer.appendMatch(location.address, memory[0], matched_len, raw_bits);
+                        self.num_matches += 1;
+                    }
+                }
+            }
+
+            processed.* += 1;
+            updateRescanProgress(self, processed.*, total_matches);
+        }
+    }
+
+    fn rescanNotChangedFullSegment(
+        self: *Scanner,
+        matches: *MatchesArray,
+        segment: targetmem.SegmentView,
+        width: usize,
+        raw_bits: u16,
+        cache: *MemoryCache,
+        processed: *usize,
+        total_matches: usize,
+    ) void {
+        const handle = &self.process_handle.?;
+        var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
+        var candidate: usize = 0;
+        while (candidate < segment.candidate_count) {
+            if (self.stop_flag) break;
+
+            const batch_len = @min(segment.candidate_count - candidate, old_buf.len - width + 1);
+            const window_len = batch_len + width - 1;
+            const address = segment.first_candidate + candidate;
+            const old = matches.dataToBytes(segment.swath_offset, candidate, window_len, &old_buf);
+            const valid = if (old.len >= width) @min(batch_len, old.len - width + 1) else 0;
+            if (valid == 0) {
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                return;
+            }
+
+            const valid_window_len = valid + width - 1;
+            const current = cache.peek(handle, address, valid_window_len) catch {
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                return;
+            };
+
+            if (!std.mem.eql(u8, current[0..valid_window_len], old[0..valid_window_len])) {
+                var diff_count: usize = 0;
+                for (0..width) |i| {
+                    if (current[i] != old[i]) diff_count += 1;
+                }
+                for (0..valid) |i| {
+                    if (diff_count != 0) {
+                        matches.removeMatch(.{
+                            .swath_offset = segment.swath_offset,
+                            .index = candidate + i,
+                            .address = address + i,
+                            .raw_match_info_bits = raw_bits,
+                        });
+                    }
+                    if (i + width < valid_window_len) {
+                        if (current[i] != old[i]) diff_count -= 1;
+                        if (current[i + width] != old[i + width]) diff_count += 1;
+                    }
+                }
+            }
+
+            candidate += valid;
+            processed.* += valid;
+            updateRescanProgress(self, processed.*, total_matches);
+            if (valid < batch_len) {
+                self.rescanNotChangedSegmentFallbackFrom(matches, segment, candidate, width, cache, processed, total_matches);
+                return;
+            }
+        }
+    }
+
+    fn rescanNotChangedSegmentFallbackFrom(
+        self: *Scanner,
+        matches: *MatchesArray,
+        segment: targetmem.SegmentView,
+        start_index: usize,
+        width: usize,
+        cache: *MemoryCache,
+        processed: *usize,
+        total_matches: usize,
+    ) void {
+        const handle = &self.process_handle.?;
+        const data_type = self.options.scan_data_type;
+        var old_bytes: [8]u8 = undefined;
+        var iterator = matches.iteratorFrom(segment.swath_offset);
+        while (iterator.next()) |location| {
+            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (location.index < start_index) continue;
+
+            // For fixed-width types stored_len == width.
+            // For ANY-types it is the candidate's per-flag width.
+            const keep = keep: {
+                const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
+                if (stored_len == 0 or stored_len > width) break :keep false;
+                const memory = cache.peek(handle, location.address, stored_len) catch break :keep false;
+                const old = matches.dataToBytes(location.swath_offset, location.index, stored_len, &old_bytes);
+                break :keep old.len == stored_len and memory.len >= stored_len and std.mem.eql(u8, memory[0..stored_len], old);
+            };
+            if (!keep) matches.removeMatch(location);
+
+            processed.* += 1;
+            updateRescanProgress(self, processed.*, total_matches);
+        }
     }
 
     fn resetMatches(self: *Scanner) void {
@@ -778,18 +2005,6 @@ pub const Scanner = struct {
             self.allocator.free(self.regions);
         }
         self.regions = &.{};
-    }
-
-    fn readValueWithFlags(self: *Scanner, address: usize, flags: MatchFlags) ScannerError!Value {
-        const length = flagsToNumericLength(flags);
-        if (length == 0) return ScannerError.UnsupportedReadDataType;
-
-        var value = Value{
-            .data = .{ .uint64_value = 0 },
-            .flags = flags,
-        };
-        try self.readBytesExact(address, value.data.bytes[0..length]);
-        return value;
     }
 
     fn ensureUndoFile(self: *Scanner) ScannerError!*std.Io.File {
@@ -849,7 +2064,17 @@ pub const Scanner = struct {
         const matches = &self.matches.?;
         try matches.finalize();
         const file = try self.ensureUndoFile();
-        const header = UndoFileHeader.init(self, matches);
+        const header = UndoFileHeader{
+            .num_matches = self.num_matches,
+            .used_len = matches.used_len,
+            .max_needed_bytes = matches.max_needed_bytes,
+            .match_count = matches.match_count,
+            .stride = matches.stride,
+            .alignment = self.options.alignment,
+            .scan_data_type = @intFromEnum(self.options.scan_data_type),
+            .scan_level = @intFromEnum(self.options.scan_level),
+            .reverse_endianness = @intFromBool(self.options.reverse_endianness),
+        };
 
         file.setLength(self.io, 0) catch return ScannerError.UndoIoFailed;
         file.writePositionalAll(self.io, std.mem.asBytes(&header), 0) catch return ScannerError.UndoIoFailed;
@@ -869,30 +2094,23 @@ pub const Scanner = struct {
         var header: UndoFileHeader = undefined;
         const header_bytes = file.readPositionalAll(self.io, std.mem.asBytes(&header), 0) catch return ScannerError.UndoIoFailed;
         if (header_bytes != @sizeOf(UndoFileHeader)) return ScannerError.UndoCorrupt;
-        try header.validate();
 
-        const used_len: usize = @intCast(header.used_len);
-        const max_needed_bytes: usize = @intCast(header.max_needed_bytes);
-        const tail_swath_offset: usize = @intCast(header.tail_swath_offset);
-        const match_count: usize = @intCast(header.match_count);
+        const used_len: usize = header.used_len;
+        const max_needed_bytes: usize = header.max_needed_bytes;
+        const match_count: usize = header.match_count;
 
         if (self.matches) |*matches| {
-            if (matches.capacity_len < used_len) self.resetMatches();
+            if (matches.stride != header.stride or matches.capacity_len < used_len) self.resetMatches();
         }
 
         const created_matches = self.matches == null;
         if (created_matches) {
-            self.matches = try MatchesArray.init(self.allocator, max_needed_bytes);
+            self.matches = try MatchesArray.init(self.allocator, max_needed_bytes, header.stride);
         }
         errdefer if (created_matches) self.resetMatches();
 
         const matches = &self.matches.?;
-        try matches.resetForStorageLoad(
-            used_len,
-            max_needed_bytes,
-            tail_swath_offset,
-            match_count,
-        );
+        try matches.resetForStorageLoad(used_len, max_needed_bytes, match_count);
         var read_offset: u64 = @sizeOf(UndoFileHeader);
         for (matches.chunks.items) |*chunk| {
             if (chunk.base >= matches.used_len) break;
@@ -901,22 +2119,31 @@ pub const Scanner = struct {
             if (storage_bytes != storage.len) return ScannerError.UndoCorrupt;
             read_offset += storage.len;
         }
-        matches.finishStorageLoad();
 
-        return header.undoMetadata();
+        return .{
+            .num_matches = header.num_matches,
+            .options = .{
+                .alignment = header.alignment,
+                .scan_data_type = @enumFromInt(header.scan_data_type),
+                .scan_level = @enumFromInt(header.scan_level),
+                .reverse_endianness = header.reverse_endianness != 0,
+            },
+        };
     }
 };
 
 const MemoryCache = struct {
-    const read_chunk_size: usize = 2048;
-    const max_size: usize = (1 << 16) + read_chunk_size;
+    // Large enough to avoid millions of tiny positional reads during rescan,
+    // with a required-length fallback for mappings that end before the prefetch.
+    const read_chunk_size: usize = 64 * 1024;
+    const max_size: usize = read_chunk_size * 2;
 
     cache: [max_size]u8 = @splat(0),
     size: usize = 0,
     base: ?usize = null,
 
     fn peek(self: *MemoryCache, handle: *ProcessHandle, addr: usize, length: usize) ScannerError![]const u8 {
-        const request_end = addr + length;
+        const request_end = std.math.add(usize, addr, length) catch return ScannerError.ReadFailed;
 
         if (self.base) |base| {
             const cache_end = base + self.size;
@@ -947,21 +2174,75 @@ const MemoryCache = struct {
         while (self.base.? + self.size < request_end) {
             const target_address = self.base.? + self.size;
             const read_len = @min(read_chunk_size, max_size - self.size);
-            const nread = handle.read(target_address, self.cache[self.size .. self.size + read_len]) catch return ScannerError.ReadFailed;
+            const required_len = request_end - target_address;
+            if (read_len == 0) return ScannerError.ReadFailed;
+            const nread = handle.read(target_address, self.cache[self.size .. self.size + read_len]) catch blk: {
+                if (read_len <= required_len) return ScannerError.ReadFailed;
+                break :blk handle.read(target_address, self.cache[self.size .. self.size + required_len]) catch return ScannerError.ReadFailed;
+            };
             if (nread == 0) return ScannerError.ReadFailed;
             self.size += nread;
             if (nread < read_len) break;
         }
 
         const base = self.base orelse return ScannerError.ReadFailed;
-        if (addr >= base + self.size) return ScannerError.ReadFailed;
+        if (addr >= base + self.size or request_end > base + self.size) return ScannerError.ReadFailed;
         return self.cache[(addr - base)..self.size];
+    }
+};
+
+const RescanSpanWriter = struct {
+    matches: *MatchesArray,
+    handle: *ProcessHandle,
+    cache: *MemoryCache,
+    pending_next: usize = 0,
+    pending_end: usize = 0,
+
+    fn appendMatch(self: *RescanSpanWriter, address: usize, first_byte: u8, matched_len: usize, raw_bits: u16) ScannerError!void {
+        try self.flushBefore(address);
+        try self.matches.appendRaw(address, first_byte, raw_bits);
+
+        const span_end = std.math.add(usize, address, matched_len) catch return ScannerError.ReadFailed;
+        self.pending_next = std.math.add(usize, address, 1) catch return ScannerError.ReadFailed;
+        self.pending_end = @max(self.pending_end, span_end);
+    }
+
+    fn appendBatch(self: *RescanSpanWriter, address: usize, old_values: []const u8, raw_bits_per_candidate: []const u16, trailing_end: usize) ScannerError!void {
+        try self.flushBefore(address);
+        try self.matches.appendRescanBatch(address, old_values, raw_bits_per_candidate);
+
+        self.pending_next = std.math.add(usize, address, old_values.len) catch return ScannerError.ReadFailed;
+        self.pending_end = @max(self.pending_end, trailing_end);
+    }
+
+    fn flushBefore(self: *RescanSpanWriter, limit: usize) ScannerError!void {
+        const target = @min(limit, self.pending_end);
+        while (self.pending_next < target) {
+            const request_len = @min(target - self.pending_next, MemoryCache.read_chunk_size);
+            const memory = self.cache.peek(self.handle, self.pending_next, request_len) catch {
+                self.pending_next = target;
+                return;
+            };
+            const available = @min(target - self.pending_next, memory.len);
+            if (available == 0) {
+                self.pending_next = target;
+                return;
+            }
+            for (memory[0..available]) |byte| {
+                try self.matches.appendRaw(self.pending_next, byte, 0);
+                self.pending_next += 1;
+            }
+        }
+        if (self.pending_next >= self.pending_end) {
+            self.pending_end = self.pending_next;
+        }
     }
 };
 
 fn scanChunkIntoMatches(
     matches: *MatchesArray,
     prepared: PreparedScan,
+    initial_kernel: ?scanroutines.InitialNumericKernel,
     user_values: []const UserValue,
     base_address: usize,
     chunk: []const u8,
@@ -971,36 +2252,409 @@ fn scanChunkIntoMatches(
     num_matches: *usize,
 ) ScannerError!void {
     var offset: usize = 0;
-    while (offset < scan_limit) : (offset += 1) {
-        const absolute_address = base_address + offset;
-        const should_check = alignment == 1 or absolute_address % alignment == 0;
-        const result = if (should_check)
-            prepared.routine(chunk[offset..], null, user_values)
-        else
-            ScanResult.noMatch();
+    if (prepared.match_type == .MATCHANY) {
+        const raw_bits = switch (prepared.data_type) {
+            .INTEGER8 => MatchFlags.i8b.bits(),
+            .INTEGER16 => MatchFlags.i16b.bits(),
+            .INTEGER32 => MatchFlags.i32b.bits(),
+            .INTEGER64 => MatchFlags.i64b.bits(),
+            .FLOAT32 => (MatchFlags{ .f32b = true }).bits(),
+            .FLOAT64 => (MatchFlags{ .f64b = true }).bits(),
+            .ANYINTEGER, .ANYFLOAT, .ANYNUMBER, .BYTEARRAY, .STRING => 0,
+        };
+        if (raw_bits != 0) {
+            const width = prepared.maxMatchLength(user_values);
+            if (width >= alignment) {
+                const matchable_len = if (chunk.len >= width) @min(scan_limit, chunk.len - width + 1) else 0;
+                const first_candidate = blk: {
+                    if (matchable_len == 0) break :blk base_address;
+                    if (alignment <= 1) break :blk base_address;
+                    const rem = base_address % alignment;
+                    break :blk if (rem == 0) base_address else base_address + (alignment - rem);
+                };
+                const match_candidate_count = blk: {
+                    if (matchable_len == 0) break :blk 0;
+                    const end = base_address + matchable_len;
+                    if (first_candidate >= end) break :blk 0;
+                    break :blk (end - first_candidate + alignment - 1) / alignment;
+                };
+                const pending_prefix = @min(required_extra_bytes.*, scan_limit);
+                if (match_candidate_count == 0) {
+                    if (pending_prefix > 0) {
+                        try matches.appendRun(base_address, chunk[0..pending_prefix], raw_bits, 0);
+                        required_extra_bytes.* -= pending_prefix;
+                    }
+                    return;
+                }
 
-        if (result.matched_len > 0) {
-            try appendScanResult(matches, absolute_address, chunk[offset], result.save, num_matches);
-            required_extra_bytes.* = result.matched_len - 1;
-        } else if (required_extra_bytes.* > 0) {
-            try matches.append(absolute_address, chunk[offset], .{});
-            required_extra_bytes.* -= 1;
+                const first_offset = first_candidate - base_address;
+                const last_offset = first_offset + (match_candidate_count - 1) * alignment;
+                const last_end = last_offset + width;
+                const store_start = if (pending_prefix > 0) 0 else first_offset;
+                const store_end = @max(pending_prefix, @min(scan_limit, last_end));
+                try matches.appendRun(base_address + store_start, chunk[store_start..store_end], raw_bits, match_candidate_count);
+                num_matches.* += match_candidate_count;
+                required_extra_bytes.* = if (last_end > scan_limit) last_end - scan_limit else 0;
+                return;
+            }
+        }
+
+        const full_any_raw_bits = switch (prepared.data_type) {
+            .ANYINTEGER => MatchFlags.integer.bits(),
+            .ANYFLOAT => MatchFlags.float.bits(),
+            .ANYNUMBER => MatchFlags.all.bits(),
+            else => 0,
+        };
+        if (full_any_raw_bits != 0) {
+            const width = prepared.maxMatchLength(user_values);
+            if (width >= alignment) {
+                const matchable_len = if (chunk.len >= width) @min(scan_limit, chunk.len - width + 1) else 0;
+                const first_candidate = blk: {
+                    if (matchable_len == 0) break :blk base_address;
+                    if (alignment <= 1) break :blk base_address;
+                    const rem = base_address % alignment;
+                    break :blk if (rem == 0) base_address else base_address + (alignment - rem);
+                };
+                const match_candidate_count = blk: {
+                    if (matchable_len == 0) break :blk 0;
+                    const end = base_address + matchable_len;
+                    if (first_candidate >= end) break :blk 0;
+                    break :blk (end - first_candidate + alignment - 1) / alignment;
+                };
+                const pending_prefix = @min(required_extra_bytes.*, scan_limit);
+                if (match_candidate_count != 0) {
+                    const first_offset = first_candidate - base_address;
+                    const last_offset = first_offset + (match_candidate_count - 1) * alignment;
+                    const next_candidate_offset = last_offset + alignment;
+                    const store_start = if (pending_prefix > 0) 0 else first_offset;
+                    const store_end = @max(pending_prefix, @min(scan_limit, next_candidate_offset));
+                    try matches.appendRun(base_address + store_start, chunk[store_start..store_end], full_any_raw_bits, match_candidate_count);
+                    num_matches.* += match_candidate_count;
+                    offset = store_end;
+                    const last_end = last_offset + width;
+                    required_extra_bytes.* = if (last_end > store_end) last_end - store_end else 0;
+                }
+            }
+        }
+
+        // STRING / BYTEARRAY MATCHANY: Each match's stored length is min(chunk.len - candidate_offset, maxInt(u16)).
+        // In the common chunk (initialScan reads an overlap of maxInt(u16), so chunk.len exceeds scan_limit by max_len)
+        // every candidate has the full max_len and a single appendRun records them all.
+        // In tail chunks lengths shrink and a per-candidate walk preserves trailing-span bytes the same way the
+        // STRING / BYTEARRAY MATCHEQUALTO paths below do.
+        if (prepared.data_type == .STRING or prepared.data_type == .BYTEARRAY) {
+            const max_len: usize = std.math.maxInt(u16);
+            const max_len_bits: u16 = std.math.maxInt(u16);
+            const first_offset: usize = blk: {
+                if (alignment <= 1) break :blk 0;
+                const rem = base_address % alignment;
+                break :blk if (rem == 0) 0 else alignment - rem;
+            };
+            const pending_prefix = @min(required_extra_bytes.*, scan_limit);
+
+            // Common chunk: every candidate in [first_offset, scan_limit) has at least max_len bytes after it (overlap reserved by caller).
+            if (chunk.len + 1 >= scan_limit + max_len) {
+                if (first_offset >= scan_limit) {
+                    if (pending_prefix > 0) {
+                        try matches.appendRun(base_address, chunk[0..pending_prefix], max_len_bits, 0);
+                        required_extra_bytes.* -= pending_prefix;
+                    }
+                    return;
+                }
+                const bulk_count = (scan_limit - first_offset - 1) / alignment + 1;
+                const last_offset = first_offset + (bulk_count - 1) * alignment;
+                const last_end = last_offset + max_len;
+                const store_start = if (pending_prefix > 0) 0 else first_offset;
+                const store_end = @max(pending_prefix, @min(scan_limit, last_end));
+                try matches.appendRun(base_address + store_start, chunk[store_start..store_end], max_len_bits, bulk_count);
+                num_matches.* += bulk_count;
+                required_extra_bytes.* = if (last_end > scan_limit) last_end - scan_limit else 0;
+                return;
+            }
+
+            // Tail chunk: per-candidate walk.
+            var pending_next: usize = 0;
+            var pending_end = required_extra_bytes.*;
+            var candidate_offset: usize = first_offset;
+            while (candidate_offset < scan_limit and candidate_offset < chunk.len) : (candidate_offset += alignment) {
+                const raw_len_usize = @min(chunk.len - candidate_offset, max_len);
+                const raw_len: u16 = @intCast(raw_len_usize);
+
+                while (pending_next < candidate_offset and pending_next < pending_end) : (pending_next += 1) {
+                    try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+                }
+
+                try matches.appendRaw(base_address + candidate_offset, chunk[candidate_offset], raw_len);
+                num_matches.* += 1;
+                pending_next = candidate_offset + 1;
+                pending_end = @max(pending_end, candidate_offset + raw_len_usize);
+            }
+
+            const flush_end = @min(pending_end, scan_limit);
+            while (pending_next < flush_end) : (pending_next += 1) {
+                try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+            }
+            required_extra_bytes.* = if (pending_end > scan_limit) pending_end - scan_limit else 0;
+            return;
         }
     }
-}
 
-fn appendScanResult(
-    matches: *MatchesArray,
-    address: usize,
-    old_byte: u8,
-    save: SaveInfo,
-    num_matches: *usize,
-) ScannerError!void {
-    const raw_bits = save.raw();
-    if (raw_bits == 0) return;
+    if (prepared.data_type == .STRING and prepared.match_type == .MATCHEQUALTO) {
+        const needle = user_values[0].string_value orelse return;
+        if (needle.len == 0) {
+            required_extra_bytes.* = 0;
+            return;
+        }
 
-    try matches.append(address, old_byte, @bitCast(raw_bits));
-    num_matches.* += 1;
+        // Length fits in u16: validateCombo gated "needle.len <= maxInt(u16)".
+        const raw_len: u16 = @intCast(needle.len);
+        var pending_next: usize = 0;
+        var pending_end = required_extra_bytes.*;
+        var search_pos: usize = 0;
+        while (std.mem.indexOfPos(u8, chunk, search_pos, needle)) |hit| {
+            if (hit >= scan_limit) break;
+            search_pos = hit + 1;
+            const absolute_address = base_address + hit;
+            if (alignment != 1 and absolute_address % alignment != 0) continue;
+
+            while (pending_next < hit and pending_next < pending_end) : (pending_next += 1) {
+                try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+            }
+
+            try matches.appendRaw(absolute_address, chunk[hit], raw_len);
+            num_matches.* += 1;
+            pending_next = hit + 1;
+            pending_end = @max(pending_end, hit + needle.len);
+        }
+
+        const flush_end = @min(pending_end, scan_limit);
+        while (pending_next < flush_end) : (pending_next += 1) {
+            try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+        }
+        required_extra_bytes.* = if (pending_end > scan_limit) pending_end - scan_limit else 0;
+        return;
+    }
+
+    if (prepared.data_type == .BYTEARRAY and prepared.match_type == .MATCHEQUALTO) {
+        const pattern = user_values[0].bytearray_value orelse return;
+        const wildcards = user_values[0].wildcard_value orelse return;
+        if (pattern.len == 0 or pattern.len != wildcards.len) {
+            required_extra_bytes.* = 0;
+            return;
+        }
+
+        // Length fits in u16: validateCombo gated "pattern.len <= maxInt(u16)".
+        const raw_len: u16 = @intCast(pattern.len);
+        var pending_next: usize = 0;
+        var pending_end = required_extra_bytes.*;
+
+        // Pick the longest contiguous FIXED-byte run in the pattern as the search anchor.
+        // A single-byte anchor (the old behaviour) is a worst case when that byte is common (e.g. 0x00 in C string padding)
+        // and also can't use std.mem.indexOfPos' multi-byte memmem acceleration.
+        // Longest-run wins both: it suppresses false anchor hits and lets indexOfPos rip through dense chunks.
+        // A no-FIXED pattern (rare but legal) falls through to the all-wildcard aligned walk below.
+        var anchor_start: usize = 0;
+        var anchor_len: usize = 0;
+        var cur_start: usize = 0;
+        var cur_len: usize = 0;
+        for (wildcards, 0..) |wildcard, i| {
+            if (wildcard == .FIXED) {
+                if (cur_len == 0) cur_start = i;
+                cur_len += 1;
+                if (cur_len > anchor_len) {
+                    anchor_start = cur_start;
+                    anchor_len = cur_len;
+                }
+            } else {
+                cur_len = 0;
+            }
+        }
+
+        if (anchor_len > 0) {
+            const needle = pattern[anchor_start .. anchor_start + anchor_len];
+            var search_pos: usize = anchor_start;
+            while (std.mem.indexOfPos(u8, chunk, search_pos, needle)) |hit| {
+                if (hit < anchor_start) {
+                    search_pos = hit + 1;
+                    continue;
+                }
+                const start = hit - anchor_start;
+                if (start >= scan_limit) break;
+                search_pos = hit + 1;
+                if (start + pattern.len > chunk.len) continue;
+
+                const absolute_address = base_address + start;
+                if (alignment != 1 and absolute_address % alignment != 0) continue;
+                if (!bytearrayMatches(chunk[start .. start + pattern.len], pattern, wildcards)) continue;
+
+                while (pending_next < start and pending_next < pending_end) : (pending_next += 1) {
+                    try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+                }
+
+                try matches.appendRaw(absolute_address, chunk[start], raw_len);
+                num_matches.* += 1;
+                pending_next = start + 1;
+                pending_end = @max(pending_end, start + pattern.len);
+            }
+        } else {
+            const matchable_len = if (chunk.len >= pattern.len) @min(scan_limit, chunk.len - pattern.len + 1) else 0;
+            var start: usize = 0;
+            while (start < matchable_len) : (start += 1) {
+                const absolute_address = base_address + start;
+                if (alignment != 1 and absolute_address % alignment != 0) continue;
+                if (!bytearrayMatches(chunk[start .. start + pattern.len], pattern, wildcards)) continue;
+
+                while (pending_next < start and pending_next < pending_end) : (pending_next += 1) {
+                    try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+                }
+
+                try matches.appendRaw(absolute_address, chunk[start], raw_len);
+                num_matches.* += 1;
+                pending_next = start + 1;
+                pending_end = @max(pending_end, start + pattern.len);
+            }
+        }
+
+        const flush_end = @min(pending_end, scan_limit);
+        while (pending_next < flush_end) : (pending_next += 1) {
+            try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+        }
+        required_extra_bytes.* = if (pending_end > scan_limit) pending_end - scan_limit else 0;
+        return;
+    }
+
+    // Fixed concrete numeric MATCHEQUALTO: serialize the target value(s) once and search the chunk
+    // with std.mem.indexOfPos instead of running the compare kernel at every candidate.
+    // Preserves alignment filtering, overlap (search advances by hit+1), and the trailing-byte pending-span pattern.
+    // Float zero exact uses two needles for +0.0 and -0.0 (different bit patterns, equal under the kernel's ""==" semantics).
+    // Float NaN exact matches nothing.
+    // ANY-numeric MATCHEQUALTO returns null from serialize and falls through to the kernel path below because it spans multiple widths.
+    if (prepared.match_type == .MATCHEQUALTO) {
+        var primary_buf: [8]u8 = undefined;
+        var secondary_buf: [8]u8 = undefined;
+        if (serializeExactNumericNeedles(prepared.data_type, user_values[0], prepared.reverse_endianness, &primary_buf, &secondary_buf)) |needles| {
+            var pending_next: usize = 0;
+            var pending_end = required_extra_bytes.*;
+            var hit_primary = std.mem.indexOfPos(u8, chunk, 0, needles.primary);
+            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.indexOfPos(u8, chunk, 0, sec) else null;
+
+            while (true) {
+                var h: usize = undefined;
+                var consumed_primary: bool = undefined;
+                if (hit_primary) |h1| {
+                    if (hit_secondary) |h2| {
+                        if (h1 <= h2) {
+                            h = h1;
+                            consumed_primary = true;
+                        } else {
+                            h = h2;
+                            consumed_primary = false;
+                        }
+                    } else {
+                        h = h1;
+                        consumed_primary = true;
+                    }
+                } else if (hit_secondary) |h2| {
+                    h = h2;
+                    consumed_primary = false;
+                } else break;
+                if (h >= scan_limit) break;
+                if (consumed_primary) {
+                    hit_primary = std.mem.indexOfPos(u8, chunk, h + 1, needles.primary);
+                } else {
+                    hit_secondary = std.mem.indexOfPos(u8, chunk, h + 1, needles.secondary.?);
+                }
+
+                const absolute_address = base_address + h;
+                if (alignment != 1 and absolute_address % alignment != 0) continue;
+
+                while (pending_next < h and pending_next < pending_end) : (pending_next += 1) {
+                    try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+                }
+
+                // Burst-append: when we just consumed a primary hit, scan forward for consecutive
+                // aligned primary matches and emit them in one appendRun rather than per-match appendRaw.
+                // Only self-overlapping (uniform) needles can produce such bursts, e.g. +0.0 / integer
+                // zero in zero-padded regions, but any user value with that property benefits.
+                // The secondary needle (when present, only for float +/-0) differs from primary by at least one byte,
+                // so it cannot match inside a uniform burst region; defensive re-search keeps the invariant explicit.
+                if (consumed_primary) {
+                    const step: usize = alignment;
+                    var burst_end = h + step;
+                    while (burst_end < scan_limit and burst_end + needles.primary.len <= chunk.len and
+                        std.mem.eql(u8, chunk[burst_end .. burst_end + needles.primary.len], needles.primary)) : (burst_end += step)
+                    {}
+                    if (burst_end > h + step) {
+                        const burst_len = (burst_end - h) / step;
+                        try matches.appendRun(absolute_address, chunk[h..burst_end], needles.raw_bits, burst_len);
+                        num_matches.* += burst_len;
+                        pending_next = burst_end;
+                        pending_end = @max(pending_end, burst_end - step + needles.primary.len);
+                        hit_primary = std.mem.indexOfPos(u8, chunk, burst_end, needles.primary);
+                        if (hit_secondary) |s2| {
+                            if (s2 < burst_end) {
+                                hit_secondary = std.mem.indexOfPos(u8, chunk, burst_end, needles.secondary.?);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                try matches.appendRaw(absolute_address, chunk[h], needles.raw_bits);
+                num_matches.* += 1;
+                pending_next = h + 1;
+                pending_end = @max(pending_end, h + needles.primary.len);
+            }
+
+            const flush_end = @min(pending_end, scan_limit);
+            while (pending_next < flush_end) : (pending_next += 1) {
+                try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+            }
+            required_extra_bytes.* = if (pending_end > scan_limit) pending_end - scan_limit else 0;
+            return;
+        }
+    }
+
+    // All other combos go through a pre-selected initial kernel.
+    // MATCHANY, STRING/BYTEARRAY MATCHEQUALTO are intercepted above,
+    // and fixed concrete numeric MATCHEQUALTO is intercepted directly above this block.
+    // MATCHUPDATE and old-value-dependent match types are short-circuited in scan() before reaching here.
+    // STRING/BYTEARRAY non-EQUALTO combos are rejected by validateCombo.
+    // That leaves numeric MATCHNOTEQUALTO/GT/LT/RANGE and the ANY-numeric MATCHEQUALTO multi-width case,
+    // which pickInitialNumericKernel always covers.
+    // ANY-numeric MATCHANY falls through here from the bulk path above with "offset" set to the first unprocessed (aligned)
+    // candidate so the tail-zone gets shorter-width raw_bits from the kernel instead of the full-width bulk raw_bits.
+    const kernel = initial_kernel.?;
+    const first_aligned_offset: usize = blk: {
+        if (alignment <= 1) break :blk offset;
+        const rem = base_address % alignment;
+        const from_zero: usize = if (rem == 0) 0 else alignment - rem;
+        break :blk @max(offset, from_zero);
+    };
+    var pending_next: usize = offset;
+    var pending_end = offset + required_extra_bytes.*;
+
+    var candidate_offset: usize = first_aligned_offset;
+    while (candidate_offset < scan_limit) : (candidate_offset += alignment) {
+        const raw_bits = kernel(chunk[candidate_offset..], user_values);
+        if (raw_bits == 0) continue;
+        const matched_len = storedLengthForExistingMatch(prepared.data_type, raw_bits);
+
+        while (pending_next < candidate_offset and pending_next < pending_end) : (pending_next += 1) {
+            try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+        }
+
+        try matches.appendRaw(base_address + candidate_offset, chunk[candidate_offset], raw_bits);
+        num_matches.* += 1;
+        pending_next = candidate_offset + 1;
+        pending_end = @max(pending_end, candidate_offset + matched_len);
+    }
+
+    const flush_end = @min(pending_end, scan_limit);
+    while (pending_next < flush_end) : (pending_next += 1) {
+        try matches.appendRaw(base_address + pending_next, chunk[pending_next], 0);
+    }
+    required_extra_bytes.* = if (pending_end > scan_limit) pending_end - scan_limit else 0;
 }
 
 fn storedLengthForExistingMatch(data_type: ScanDataType, raw_bits: u16) usize {
@@ -1010,27 +2664,163 @@ fn storedLengthForExistingMatch(data_type: ScanDataType, raw_bits: u16) usize {
     };
 }
 
-fn canonicalReadFlags(data_type: ScanDataType) ScannerError!MatchFlags {
+const ExactNumericNeedles = struct {
+    primary: []const u8,
+    secondary: ?[]const u8,
+    raw_bits: u16,
+};
+
+/// Serializes a fixed concrete numeric MATCHEQUALTO target into 1-2 byte needles plus the raw_bits to record alongside each match.
+/// Returns null for unsupported data types (ANY-numeric, STRING, BYTEARRAY),
+/// for float NaN (matches nothing under "=="), and for user-value flag sets that have no usable bit for this data type.
+/// Float zero produces two needles (+0.0 and -0.0), which have different bit patterns but compare equal under "==".
+fn serializeExactNumericNeedles(
+    data_type: ScanDataType,
+    user_value: UserValue,
+    reverse_endianness: bool,
+    primary_buf: *[8]u8,
+    secondary_buf: *[8]u8,
+) ?ExactNumericNeedles {
+    const needle_width: usize = switch (data_type) {
+        .INTEGER8 => 1,
+        .INTEGER16 => 2,
+        .INTEGER32, .FLOAT32 => 4,
+        .INTEGER64, .FLOAT64 => 8,
+        else => return null,
+    };
+    const flags = user_value.flags;
+    const raw_bits_mask: u16 = switch (data_type) {
+        .INTEGER8 => MatchFlags.i8b.bits(),
+        .INTEGER16 => MatchFlags.i16b.bits(),
+        .INTEGER32 => MatchFlags.i32b.bits(),
+        .INTEGER64 => MatchFlags.i64b.bits(),
+        .FLOAT32 => (MatchFlags{ .f32b = true }).bits(),
+        .FLOAT64 => (MatchFlags{ .f64b = true }).bits(),
+        else => unreachable,
+    };
+    const raw_bits: u16 = flags.bits() & raw_bits_mask;
+    if (raw_bits == 0) return null;
+
+    var secondary: ?[]const u8 = null;
+    switch (data_type) {
+        .INTEGER8 => {
+            // When both signed and unsigned flags are set the needle is only valid if the bit patterns agree.
+            // parseNumber always emits matching payloads, but a contrived UserValue could disagree, so fall back
+            // to the general kernel rather than silently mis-record raw_bits.
+            const signed_bits: u8 = @bitCast(user_value.int8_value);
+            if (flags.u8b and flags.s8b and signed_bits != user_value.uint8_value) return null;
+            primary_buf[0] = if (flags.u8b) user_value.uint8_value else signed_bits;
+        },
+        .INTEGER16 => {
+            const signed_bits: u16 = @bitCast(user_value.int16_value);
+            if (flags.u16b and flags.s16b and signed_bits != user_value.uint16_value) return null;
+            const v: u16 = if (flags.u16b) user_value.uint16_value else signed_bits;
+            std.mem.writeInt(u16, primary_buf[0..2], if (reverse_endianness) @byteSwap(v) else v, .native);
+        },
+        .INTEGER32 => {
+            const signed_bits: u32 = @bitCast(user_value.int32_value);
+            if (flags.u32b and flags.s32b and signed_bits != user_value.uint32_value) return null;
+            const v: u32 = if (flags.u32b) user_value.uint32_value else signed_bits;
+            std.mem.writeInt(u32, primary_buf[0..4], if (reverse_endianness) @byteSwap(v) else v, .native);
+        },
+        .INTEGER64 => {
+            const signed_bits: u64 = @bitCast(user_value.int64_value);
+            if (flags.u64b and flags.s64b and signed_bits != user_value.uint64_value) return null;
+            const v: u64 = if (flags.u64b) user_value.uint64_value else signed_bits;
+            std.mem.writeInt(u64, primary_buf[0..8], if (reverse_endianness) @byteSwap(v) else v, .native);
+        },
+        .FLOAT32 => {
+            const v = user_value.float32_value;
+            if (std.math.isNan(v)) return null;
+            // Zero compares equal across +0.0 and -0.0, so always emit both bit patterns
+            // regardless of which sign the user supplied otherwise a -0.0 input would produce identical
+            // primary+secondary needles and the dual-cursor loop would double-emit the same address.
+            const primary_bits: u32 = if (v == 0.0) 0 else @bitCast(v);
+            std.mem.writeInt(u32, primary_buf[0..4], if (reverse_endianness) @byteSwap(primary_bits) else primary_bits, .native);
+            if (v == 0.0) {
+                const neg_zero: f32 = -0.0;
+                const neg_bits: u32 = @bitCast(neg_zero);
+                std.mem.writeInt(u32, secondary_buf[0..4], if (reverse_endianness) @byteSwap(neg_bits) else neg_bits, .native);
+                secondary = secondary_buf[0..4];
+            }
+        },
+        .FLOAT64 => {
+            const v = user_value.float64_value;
+            if (std.math.isNan(v)) return null;
+            const primary_bits: u64 = if (v == 0.0) 0 else @bitCast(v);
+            std.mem.writeInt(u64, primary_buf[0..8], if (reverse_endianness) @byteSwap(primary_bits) else primary_bits, .native);
+            if (v == 0.0) {
+                const neg_zero: f64 = -0.0;
+                const neg_bits: u64 = @bitCast(neg_zero);
+                std.mem.writeInt(u64, secondary_buf[0..8], if (reverse_endianness) @byteSwap(neg_bits) else neg_bits, .native);
+                secondary = secondary_buf[0..8];
+            }
+        },
+        else => unreachable,
+    }
+    return .{ .primary = primary_buf[0..needle_width], .secondary = secondary, .raw_bits = raw_bits };
+}
+
+/// MATCHANY rescan flag computation: re-broadens to every width that fits in the previously-stored byte length.
+/// Concrete fixed types yield exactly their own flag (stored_len == width).
+/// ANY-types yield every sub-width that fits.
+/// STRING/BYTEARRAY pass the stored length through as raw_bits.
+fn matchAnyRawBitsForStoredLength(data_type: ScanDataType, stored_len: usize) u16 {
     return switch (data_type) {
-        .INTEGER8 => MatchFlags.i8b,
-        .INTEGER16 => MatchFlags.i16b,
-        .INTEGER32 => MatchFlags.i32b,
-        .INTEGER64 => MatchFlags.i64b,
-        .FLOAT32 => .{ .f32b = true },
-        .FLOAT64 => .{ .f64b = true },
-        else => ScannerError.UnsupportedReadDataType,
+        .INTEGER8 => if (stored_len >= 1) MatchFlags.i8b.bits() else 0,
+        .INTEGER16 => if (stored_len >= 2) MatchFlags.i16b.bits() else 0,
+        .INTEGER32 => if (stored_len >= 4) MatchFlags.i32b.bits() else 0,
+        .INTEGER64 => if (stored_len >= 8) MatchFlags.i64b.bits() else 0,
+        .FLOAT32 => if (stored_len >= 4) (MatchFlags{ .f32b = true }).bits() else 0,
+        .FLOAT64 => if (stored_len >= 8) (MatchFlags{ .f64b = true }).bits() else 0,
+        .ANYINTEGER => scanroutines.anyIntegerInitialBits(stored_len),
+        .ANYFLOAT => scanroutines.anyFloatInitialBits(stored_len),
+        .ANYNUMBER => scanroutines.anyIntegerInitialBits(stored_len) | scanroutines.anyFloatInitialBits(stored_len),
+        .BYTEARRAY, .STRING => if (stored_len <= std.math.maxInt(u16)) @intCast(stored_len) else 0,
     };
 }
 
-fn matchReadLength(data_type: ScanDataType, raw_bits: u16) ScannerError!usize {
+fn bytearrayMatches(memory: []const u8, pattern: []const u8, wildcards: []const value_mod.Wildcard) bool {
+    if (pattern.len != wildcards.len or memory.len < pattern.len) return false;
+    for (pattern, wildcards, 0..) |byte, wildcard, i| {
+        if (byte != (memory[i] & @intFromEnum(wildcard))) return false;
+    }
+    return true;
+}
+
+fn fullSharedStrideOneWidth(segment: targetmem.SegmentView, data_type: ScanDataType, max_width: usize) ?usize {
+    if (segment.header.match_count == 0 or
+        segment.first_candidate != segment.header.first_byte_in_child or
+        segment.header.layout != .shared_raw_bits or
+        segment.header.exception_count != 0 or
+        segment.header.match_count != segment.candidate_count)
+    {
+        return null;
+    }
+
+    const stored_width = storedLengthForExistingMatch(data_type, segment.header.shared_raw_bits);
+    if (stored_width == 0 or stored_width > max_width) return null;
     return switch (data_type) {
-        .BYTEARRAY, .STRING => if (raw_bits == 0) ScannerError.UnsupportedReadDataType else raw_bits,
-        else => blk: {
-            const length = flagsToNumericLength(@bitCast(raw_bits));
-            if (length == 0) return ScannerError.UnsupportedReadDataType;
-            break :blk length;
-        },
+        .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => stored_width,
+        .INTEGER8, .INTEGER16, .INTEGER32, .INTEGER64, .FLOAT32, .FLOAT64 => if (stored_width == max_width) stored_width else null,
+        .BYTEARRAY, .STRING => null,
     };
+}
+
+inline fn updateProgress(scanner: *Scanner, processed: usize, total: usize) void {
+    if (total == 0) {
+        scanner.scan_progress = 1.0;
+        return;
+    }
+    const processed_float: f64 = @floatFromInt(processed);
+    const total_float: f64 = @floatFromInt(total);
+    scanner.scan_progress = @min(1.0, processed_float / total_float);
+}
+
+inline fn updateRescanProgress(scanner: *Scanner, processed: usize, total_matches: usize) void {
+    if (processed & 0x3fff == 0) {
+        updateProgress(scanner, processed, total_matches);
+    }
 }
 
 fn matchReadFlags(data_type: ScanDataType, raw_bits: u16) ScannerError!MatchFlags {
@@ -1038,11 +2828,55 @@ fn matchReadFlags(data_type: ScanDataType, raw_bits: u16) ScannerError!MatchFlag
         .BYTEARRAY, .STRING => ScannerError.UnsupportedReadDataType,
         .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => blk: {
             const flags: MatchFlags = @bitCast(raw_bits);
-            if (!flags.hasAny()) return ScannerError.UnsupportedReadDataType;
+            if (flags.bits() == 0) return ScannerError.UnsupportedReadDataType;
             break :blk flags;
         },
-        else => canonicalReadFlags(data_type),
+        .INTEGER8 => MatchFlags.i8b,
+        .INTEGER16 => MatchFlags.i16b,
+        .INTEGER32 => MatchFlags.i32b,
+        .INTEGER64 => MatchFlags.i64b,
+        .FLOAT32 => .{ .f32b = true },
+        .FLOAT64 => .{ .f64b = true },
     };
+}
+
+fn decodeValueForTargetEndian(data_type: ScanDataType, reverse_endianness: bool, value: Value) Value {
+    if (!reverse_endianness) return value;
+
+    const width: usize = switch (data_type) {
+        .INTEGER8 => if ((value.flags.bits() & MatchFlags.i8b.bits()) != 0) 1 else return value,
+        .INTEGER16 => if ((value.flags.bits() & MatchFlags.i16b.bits()) != 0) 2 else return value,
+        .INTEGER32 => if ((value.flags.bits() & MatchFlags.i32b.bits()) != 0) 4 else return value,
+        .INTEGER64 => if ((value.flags.bits() & MatchFlags.i64b.bits()) != 0) 8 else return value,
+        .FLOAT32 => if (value.flags.f32b) 4 else return value,
+        .FLOAT64 => if (value.flags.f64b) 8 else return value,
+        .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => blk: {
+            const bits = value.flags.bits();
+            if (bits == 0) return value;
+
+            const width1 = MatchFlags.i8b.bits();
+            const width2 = MatchFlags.i16b.bits();
+            const width4 = MatchFlags.i32b.bits() | (MatchFlags{ .f32b = true }).bits();
+            const width8 = MatchFlags.i64b.bits() | (MatchFlags{ .f64b = true }).bits();
+
+            if ((bits & ~width1) == 0) break :blk 1;
+            if ((bits & ~width2) == 0) break :blk 2;
+            if ((bits & ~width4) == 0) break :blk 4;
+            if ((bits & ~width8) == 0) break :blk 8;
+            return value;
+        },
+        .BYTEARRAY, .STRING => return value,
+    };
+
+    var result = value;
+    switch (width) {
+        1 => {},
+        2 => result.data.uint16_value = @byteSwap(result.data.uint16_value),
+        4 => result.data.uint32_value = @byteSwap(result.data.uint32_value),
+        8 => result.data.uint64_value = @byteSwap(result.data.uint64_value),
+        else => unreachable,
+    }
+    return result;
 }
 
 fn serializeWriteValue(
@@ -1052,33 +2886,62 @@ fn serializeWriteValue(
     expected_length: ?usize,
     scratch: *[8]u8,
 ) ScannerError![]const u8 {
-    const endian: std.builtin.Endian = if (reverse_endianness) .big else .little;
-
     return switch (data_type) {
         .INTEGER8 => blk: {
-            scratch[0] = try encodeInteger8(user_value);
+            if (user_value.flags.u8b) {
+                scratch[0] = user_value.uint8_value;
+            } else if (user_value.flags.s8b) {
+                scratch[0] = @bitCast(user_value.int8_value);
+            } else {
+                return ScannerError.InvalidWriteValue;
+            }
             break :blk scratch[0..1];
         },
         .INTEGER16 => blk: {
-            std.mem.writeInt(u16, scratch[0..2], try encodeInteger16(user_value), endian);
+            var value: u16 = if (user_value.flags.u16b)
+                user_value.uint16_value
+            else if (user_value.flags.s16b)
+                @bitCast(user_value.int16_value)
+            else
+                return ScannerError.InvalidWriteValue;
+            if (reverse_endianness) value = @byteSwap(value);
+            std.mem.writeInt(u16, scratch[0..2], value, .native);
             break :blk scratch[0..2];
         },
         .INTEGER32 => blk: {
-            std.mem.writeInt(u32, scratch[0..4], try encodeInteger32(user_value), endian);
+            var value: u32 = if (user_value.flags.u32b)
+                user_value.uint32_value
+            else if (user_value.flags.s32b)
+                @bitCast(user_value.int32_value)
+            else
+                return ScannerError.InvalidWriteValue;
+            if (reverse_endianness) value = @byteSwap(value);
+            std.mem.writeInt(u32, scratch[0..4], value, .native);
             break :blk scratch[0..4];
         },
         .INTEGER64 => blk: {
-            std.mem.writeInt(u64, scratch[0..8], try encodeInteger64(user_value), endian);
+            var value: u64 = if (user_value.flags.u64b)
+                user_value.uint64_value
+            else if (user_value.flags.s64b)
+                @bitCast(user_value.int64_value)
+            else
+                return ScannerError.InvalidWriteValue;
+            if (reverse_endianness) value = @byteSwap(value);
+            std.mem.writeInt(u64, scratch[0..8], value, .native);
             break :blk scratch[0..8];
         },
         .FLOAT32 => blk: {
             if (!user_value.flags.f32b) return ScannerError.InvalidWriteValue;
-            std.mem.writeInt(u32, scratch[0..4], @bitCast(user_value.float32_value), endian);
+            var value: u32 = @bitCast(user_value.float32_value);
+            if (reverse_endianness) value = @byteSwap(value);
+            std.mem.writeInt(u32, scratch[0..4], value, .native);
             break :blk scratch[0..4];
         },
         .FLOAT64 => blk: {
             if (!user_value.flags.f64b) return ScannerError.InvalidWriteValue;
-            std.mem.writeInt(u64, scratch[0..8], @bitCast(user_value.float64_value), endian);
+            var value: u64 = @bitCast(user_value.float64_value);
+            if (reverse_endianness) value = @byteSwap(value);
+            std.mem.writeInt(u64, scratch[0..8], value, .native);
             break :blk scratch[0..8];
         },
         .BYTEARRAY => {
@@ -1097,30 +2960,6 @@ fn serializeWriteValue(
         },
         .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => return ScannerError.UnsupportedWriteDataType,
     };
-}
-
-fn encodeInteger8(user_value: UserValue) ScannerError!u8 {
-    if (user_value.flags.u8b) return user_value.uint8_value;
-    if (user_value.flags.s8b) return @bitCast(user_value.int8_value);
-    return ScannerError.InvalidWriteValue;
-}
-
-fn encodeInteger16(user_value: UserValue) ScannerError!u16 {
-    if (user_value.flags.u16b) return user_value.uint16_value;
-    if (user_value.flags.s16b) return @bitCast(user_value.int16_value);
-    return ScannerError.InvalidWriteValue;
-}
-
-fn encodeInteger32(user_value: UserValue) ScannerError!u32 {
-    if (user_value.flags.u32b) return user_value.uint32_value;
-    if (user_value.flags.s32b) return @bitCast(user_value.int32_value);
-    return ScannerError.InvalidWriteValue;
-}
-
-fn encodeInteger64(user_value: UserValue) ScannerError!u64 {
-    if (user_value.flags.u64b) return user_value.uint64_value;
-    if (user_value.flags.s64b) return @bitCast(user_value.int64_value);
-    return ScannerError.InvalidWriteValue;
 }
 
 fn flagsToNumericLength(flags: value_mod.MatchFlags) usize {
@@ -1173,16 +3012,6 @@ fn effectiveAlignment(alignment: u16, data_type: ScanDataType) u16 {
     };
 }
 
-fn calculateMaxMatchStorage(regions: []const Region) usize {
-    var total: usize = @sizeOf(targetmem.SwathHeader);
-    for (regions) |region| {
-        total += @sizeOf(targetmem.SwathHeader);
-        total += region.size * @sizeOf(targetmem.OldValueAndMatchInfo);
-    }
-    total += @sizeOf(targetmem.SwathHeader);
-    return total;
-}
-
 fn regionIdIncluded(region_id: u32, region_ids: []const usize) bool {
     for (region_ids) |candidate| {
         if (region_id == candidate) return true;
@@ -1193,6 +3022,25 @@ fn regionIdIncluded(region_id: u32, region_ids: []const usize) bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn attachScannerToTestMemory(scanner: *Scanner, allocator: Allocator, memory: []u8) !void {
+    const pid = std.c.getpid();
+    scanner.process_handle = ProcessHandle.attach(scanner.io, pid) catch |err| switch (err) {
+        ProcessError.AttachFailed => return error.SkipZigTest,
+        else => return err,
+    };
+
+    scanner.regions = try allocator.alloc(Region, 1);
+    scanner.regions[0] = .{
+        .start = @intFromPtr(memory.ptr),
+        .size = memory.len,
+        .kind = .HEAP,
+        .flags = .{ .read = true, .write = true, .exec = false, .shared = false, .private = true },
+        .load_addr = 0,
+        .id = 0,
+        .filename = try allocator.dupe(u8, ""),
+    };
+}
 
 test "Init: starts detached with defaults" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
@@ -1219,6 +3067,61 @@ test "prepareScan: requires attachment" {
 
     const user = try UserValue.parseNumber("5");
     try std.testing.expectError(ScannerError.NotAttached, scanner.prepareScan(.MATCHEQUALTO, &.{user}));
+}
+
+test "scan MATCHUPDATE requires attachment on fresh session" {
+    var scanner = Scanner.init(std.testing.allocator, std.testing.io);
+    defer scanner.deinit();
+
+    try std.testing.expect(scanner.fresh_session);
+    try std.testing.expectError(ScannerError.NotAttached, scanner.scan(.MATCHUPDATE, &.{}));
+    // Boundary check must run before fresh_session is flipped.
+    try std.testing.expect(scanner.fresh_session);
+}
+
+test "scan MATCHCHANGED on fresh session returns empty without allocating" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    try std.testing.expect(scanner.matches == null);
+    try scanner.scan(.MATCHCHANGED, &.{});
+
+    // No matches and no allocated storage, old-value rescans on a fresh
+    // session match nothing by definition, so we skip the memory walk.
+    try std.testing.expectEqual(0, scanner.matchCount());
+    try std.testing.expect(scanner.matches == null);
+    try std.testing.expect(!scanner.fresh_session);
+    const complete_progress: f32 = 1.0;
+    try std.testing.expectEqual(complete_progress, scanner.scan_progress);
+}
+
+test "scan fresh MATCHINCREASEDBY still validates required user value count" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    // MATCHINCREASEDBY requires user_values.
+    // The short-circuit must not bypass validateCombo, so an empty value list still surfaces the combo error.
+    try std.testing.expectError(ScannerError.UnsupportedScanCombination, scanner.scan(.MATCHINCREASEDBY, &.{}));
+    try std.testing.expect(scanner.fresh_session);
+}
+
+test "scan fresh MATCHCHANGED still requires attachment" {
+    var scanner = Scanner.init(std.testing.allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+
+    try std.testing.expectError(ScannerError.NotAttached, scanner.scan(.MATCHCHANGED, &.{}));
+    try std.testing.expect(scanner.fresh_session);
 }
 
 test "scanPointers: scans process memory and writes direct and nested pointer paths" {
@@ -1299,13 +3202,11 @@ test "ensureMatchStorage: allocates lazily" {
     const matches = try scanner.ensureMatchStorage(256);
     try std.testing.expectEqual(0, matches.matchCount());
     try std.testing.expect(scanner.matches != null);
-    try std.testing.expect(matches.capacity_len >= @sizeOf(targetmem.SwathHeader));
-    try std.testing.expect(matches.capacity_len <= 256);
+    try std.testing.expectEqual(0, matches.capacity_len);
     try std.testing.expectEqual(256, matches.max_needed_bytes);
 
-    const storage_capacity = scanner.matches.?.capacity_len;
     const reused = try scanner.ensureMatchStorage(512);
-    try std.testing.expectEqual(storage_capacity, reused.capacity_len);
+    try std.testing.expectEqual(0, reused.capacity_len);
     try std.testing.expectEqual(256, reused.max_needed_bytes);
 }
 
@@ -1313,9 +3214,9 @@ test "setters update scanner options" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
 
-    scanner.setDataType(.FLOAT64);
+    try scanner.setDataType(.FLOAT64);
     try scanner.setScanLevel(.ALL_RW);
-    scanner.setReverseEndianness(true);
+    try scanner.setReverseEndianness(true);
     scanner.setStopFlag(true);
 
     try std.testing.expectEqual(ScanDataType.FLOAT64, scanner.options.scan_data_type);
@@ -1324,11 +3225,48 @@ test "setters update scanner options" {
     try std.testing.expect(scanner.stop_flag);
 }
 
+test "setDataType: requires a fresh session" {
+    var scanner = Scanner.init(std.testing.allocator, std.testing.io);
+    defer scanner.deinit();
+
+    try scanner.setDataType(.FLOAT64);
+    try std.testing.expectEqual(ScanDataType.FLOAT64, scanner.options.scan_data_type);
+
+    scanner.fresh_session = false;
+    try std.testing.expectError(ScannerError.OptionRequiresReset, scanner.setDataType(.INTEGER16));
+    try std.testing.expectEqual(ScanDataType.FLOAT64, scanner.options.scan_data_type);
+}
+
+test "setReverseEndianness: requires a fresh session" {
+    var scanner = Scanner.init(std.testing.allocator, std.testing.io);
+    defer scanner.deinit();
+
+    try scanner.setReverseEndianness(true);
+    try std.testing.expect(scanner.options.reverse_endianness);
+
+    scanner.fresh_session = false;
+    try std.testing.expectError(ScannerError.OptionRequiresReset, scanner.setReverseEndianness(false));
+    try std.testing.expect(scanner.options.reverse_endianness);
+}
+
+test "setAlignment: requires a fresh session" {
+    var scanner = Scanner.init(std.testing.allocator, std.testing.io);
+    defer scanner.deinit();
+
+    try scanner.setAlignment(4);
+    const expected_alignment: u16 = 4;
+    try std.testing.expectEqual(expected_alignment, scanner.options.alignment);
+
+    scanner.fresh_session = false;
+    try std.testing.expectError(ScannerError.OptionRequiresReset, scanner.setAlignment(8));
+    try std.testing.expectEqual(expected_alignment, scanner.options.alignment);
+}
+
 test "match helpers expose stored match ergonomically" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x4000, 0x78, .{ .u32b = true, .s32b = true });
     try matches.append(0x4001, 0x56, .{});
     try matches.append(0x4002, 0x34, .{});
@@ -1355,7 +3293,7 @@ test "storedMatchBytes: returns raw stored bytes" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
 
-    var numeric_matches = try MatchesArray.init(std.testing.allocator, 256);
+    var numeric_matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try numeric_matches.append(0x5000, 0x2a, .{ .u8b = true, .s8b = true });
     try numeric_matches.finalize();
 
@@ -1370,8 +3308,8 @@ test "storedMatchBytes: returns raw stored bytes" {
     scanner.resetMatches();
     scanner.scan_progress = 0;
 
-    var byte_matches = try MatchesArray.init(std.testing.allocator, 256);
-    try byte_matches.append(0x6000, 0xaa, @bitCast(@as(u16, 3)));
+    var byte_matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try byte_matches.appendRaw(0x6000, 0xaa, 3);
     try byte_matches.append(0x6001, 0xbb, .{});
     try byte_matches.append(0x6002, 0xcc, .{});
     try byte_matches.finalize();
@@ -1385,10 +3323,14 @@ test "storedMatchBytes: returns raw stored bytes" {
 }
 
 test "clearUndoHistory: clears cache-file backed undo state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
+    scanner.undo_file = try tmp.dir.createFile(scanner.io, "undo.bin", .{ .read = true, .truncate = true });
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x7000, 0x2a, .{ .u8b = true, .s8b = true });
     try matches.finalize();
 
@@ -1409,14 +3351,20 @@ test "clearUndoHistory: clears cache-file backed undo state" {
 }
 
 test "undoLastScan: restores previous match list and options" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
+    scanner.undo_file = try tmp.dir.createFile(scanner.io, "undo.bin", .{ .read = true, .truncate = true });
 
-    var old_matches = try MatchesArray.init(std.testing.allocator, 256);
+    var old_matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try old_matches.append(0x7100, 0x11, .{ .u8b = true, .s8b = true });
     try old_matches.finalize();
 
-    var current_matches = try MatchesArray.init(std.testing.allocator, 256);
+    var current_matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    var current_matches_owned = true;
+    errdefer if (current_matches_owned) current_matches.deinit();
     try current_matches.append(0x7200, 0x22, .{ .u8b = true, .s8b = true });
     try current_matches.finalize();
 
@@ -1431,8 +3379,10 @@ test "undoLastScan: restores previous match list and options" {
     try scanner.saveCurrentMatchesForUndo();
 
     scanner.resetMatches();
+    const current_match_count = current_matches.matchCount();
     scanner.matches = current_matches;
-    scanner.num_matches = current_matches.matchCount();
+    current_matches_owned = false;
+    scanner.num_matches = current_match_count;
     scanner.options = .{
         .alignment = 1,
         .scan_data_type = .FLOAT64,
@@ -1456,13 +3406,17 @@ test "undoLastScan: restores previous match list and options" {
 }
 
 test "snapshot: requires a fresh reset state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
+    scanner.undo_file = try tmp.dir.createFile(scanner.io, "undo.bin", .{ .read = true, .truncate = true });
 
     scanner.fresh_session = false;
     try std.testing.expectError(ScannerError.SnapshotRequiresReset, scanner.snapshot());
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x7300, 0x44, .{ .u8b = true, .s8b = true });
     try matches.finalize();
 
@@ -1511,7 +3465,7 @@ test "rescanMatches: shrinks integer matches and stores current values" {
         .filename = try allocator.dupe(u8, ""),
     };
 
-    var matches = try MatchesArray.init(allocator, 256);
+    var matches = try MatchesArray.init(allocator, 256, 1);
     for ([_]usize{ 0, 8 }) |offset| {
         try matches.append(base_address + offset, memory[offset], MatchFlags.i32b);
         for (1..4) |i| {
@@ -1529,6 +3483,1525 @@ test "rescanMatches: shrinks integer matches and stores current values" {
     const kept = try scanner.matchAt(0);
     try std.testing.expectEqual(base_address + 8, kept.address);
     try std.testing.expectEqual(0x33333333, kept.stored_value.data.uint32_value);
+}
+
+test "rescanMatches: update refreshes anynumber bytes and preserves narrowed flags" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0x34, 0x12 };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYNUMBER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0xcd, 0xab };
+    const raw_bits = (MatchFlags{ .u16b = true }).bits();
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, raw_bits, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHUPDATE, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(raw_bits, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: update refreshes overlapping string bytes" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'x', 'x', 'x', 'x', 'y', 'y' };
+    const raw_len: u16 = 4;
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    for (old_bytes, 0..) |byte, i| {
+        const raw_bits = if (i == 0 or i == 2) raw_len else 0;
+        try matches.appendRaw(base_address + i, byte, raw_bits);
+    }
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHUPDATE, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(2, scanner.matchCount());
+    var first: [4]u8 = undefined;
+    var second: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, memory[0..4], try scanner.storedMatchBytes(0, &first));
+    try std.testing.expectEqualSlices(u8, memory[2..6], try scanner.storedMatchBytes(1, &second));
+    try std.testing.expectEqual(raw_len, (try scanner.matchAt(0)).raw_match_info_bits);
+    try std.testing.expectEqual(raw_len, (try scanner.matchAt(1)).raw_match_info_bits);
+}
+
+test "rescanMatches: update refreshes bytearray bytes and preserves length" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0xaa, 0xbb, 0xcc };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .BYTEARRAY;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0x11, 0x22, 0x33 };
+    const raw_len: u16 = old_bytes.len;
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, raw_len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHUPDATE, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(raw_len, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [3]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: MATCHANY refreshes fixed INTEGER32 bytes and asserts type flag" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 0xdeadbeef, .native);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 0x11223344, .native);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.i32b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHANY, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: MATCHANY on ANYINTEGER re-broadens only widths fitting stored length" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0x34, 0x12 };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0xcd, 0xab };
+    // Narrowed to a single 16-bit width: stored_len == 2.
+    const narrowed_bits = MatchFlags.i16b.bits();
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, narrowed_bits, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHANY, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    // stored_len == 2 -> only i8b and i16b widths fit. i32b/i64b must not appear.
+    const expected_bits = MatchFlags.i8b.bits() | MatchFlags.i16b.bits();
+    try std.testing.expectEqual(expected_bits, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: MATCHANY on STRING preserves stored length and refreshes bytes" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'c', 'd' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'x', 'x', 'x', 'x' };
+    const raw_len: u16 = old_bytes.len;
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, raw_len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHANY, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(raw_len, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: string exact can shrink stored length" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'c', 'd', 'e' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'x', 'x', 'x', 'x', 'x' };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{ .string_value = "abc" };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(3, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [3]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, "abc", try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: string exact preserves previous-length read limit" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'c', 'd' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'a', 'b', 'c' };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{ .string_value = "abcd" };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(0, scanner.matchCount());
+}
+
+test "rescanMatches: string exact preserves overlapping survivors" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'a', 'b', 'a' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'x', 'x', 'x', 'x', 'x' };
+    const raw_len: u16 = 3;
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    for (old_bytes, 0..) |byte, i| {
+        const raw_bits = if (i == 0 or i == 2) raw_len else 0;
+        try matches.appendRaw(base_address + i, byte, raw_bits);
+    }
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{ .string_value = "aba" };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(2, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 2, (try scanner.matchAt(1)).address);
+    var first: [3]u8 = undefined;
+    var second: [3]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, "aba", try scanner.storedMatchBytes(0, &first));
+    try std.testing.expectEqualSlices(u8, "aba", try scanner.storedMatchBytes(1, &second));
+}
+
+test "rescanMatches: bytearray exact can shrink stored length" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .BYTEARRAY;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const pattern = [_]u8{ 0xaa, 0xbb };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(2, (try scanner.matchAt(0)).raw_match_info_bits);
+    var stored: [2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &pattern, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: bytearray exact preserves previous-length read limit" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0xaa, 0xbb, 0xcc };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .BYTEARRAY;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0xaa, 0xbb };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const pattern = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(0, scanner.matchCount());
+}
+
+test "rescanMatches: bytearray exact preserves wildcard predicate" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0xaa, 0x77, 0xcc };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .BYTEARRAY;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0x11, 0x22, 0x33 };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const pattern = [_]u8{ 0xaa, 0x00, 0xcc };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    var stored: [3]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &memory, try scanner.storedMatchBytes(0, &stored));
+}
+
+test "rescanMatches: string exact rejects oversized needle" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 'a', 'b', 'c' };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .STRING;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 'a', 'b', 'c' };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+    const original_count = scanner.matchCount();
+
+    const big = try allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer allocator.free(big);
+    @memset(big, 'a');
+    const user = UserValue{ .string_value = big };
+
+    try std.testing.expectError(ScannerError.UnsupportedScanCombination, scanner.rescanMatches(.MATCHEQUALTO, &.{user}));
+
+    // Validation must fail before any mutation to existing matches.
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(original_count, scanner.matchCount());
+}
+
+test "rescanMatches: bytearray exact rejects oversized pattern" {
+    const allocator = std.testing.allocator;
+
+    var memory = [_]u8{ 0xaa, 0xbb, 0xcc };
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .BYTEARRAY;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_bytes = [_]u8{ 0xaa, 0xbb, 0xcc };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, old_bytes.len, 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+    const original_count = scanner.matchCount();
+
+    const big_pattern = try allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer allocator.free(big_pattern);
+    @memset(big_pattern, 0xaa);
+    const big_wildcards = try allocator.alloc(value_mod.Wildcard, std.math.maxInt(u16) + 1);
+    defer allocator.free(big_wildcards);
+    @memset(big_wildcards, .FIXED);
+    const user = UserValue{ .bytearray_value = big_pattern, .wildcard_value = big_wildcards };
+
+    try std.testing.expectError(ScannerError.UnsupportedScanCombination, scanner.rescanMatches(.MATCHEQUALTO, &.{user}));
+
+    // Validation must fail before any mutation to existing matches.
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(original_count, scanner.matchCount());
+}
+
+test "rescanMatches: preserves overlapping survivor spans" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.append(base_address, memory[0], MatchFlags.i32b);
+    try matches.append(base_address + 1, memory[1], MatchFlags.i32b);
+    try matches.append(base_address + 2, memory[2], .{});
+    try matches.append(base_address + 3, memory[3], .{});
+    try matches.append(base_address + 4, memory[4], .{});
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    memory[0] = 1;
+    memory[4] = 2;
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(2, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 1, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(5, scanner.matches.?.storedByteCount());
+    try std.testing.expectEqual(1, (try scanner.matchAt(0)).stored_value.data.uint32_value);
+    try std.testing.expectEqual(0x02000000, (try scanner.matchAt(1)).stored_value.data.uint32_value);
+}
+
+test "rescanMatches: fixed integer changed batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &memory, MatchFlags.i32b.bits(), memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(4, scanner.matchCount());
+    try std.testing.expectEqual(base_address + 2, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 3, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(base_address + 4, (try scanner.matchAt(2)).address);
+    try std.testing.expectEqual(base_address + 5, (try scanner.matchAt(3)).address);
+}
+
+test "rescanMatches: fixed integer exact stride one and stride four agree on aligned matches" {
+    const allocator = std.testing.allocator;
+
+    var memory: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, memory[4..8], 5, .native);
+    std.mem.writeInt(u32, memory[12..16], 5, .native);
+
+    const user = UserValue{
+        .int32_value = 5,
+        .uint32_value = 5,
+        .flags = MatchFlags.i32b,
+    };
+    const expected_offsets = [_]usize{ 4, 12 };
+
+    {
+        var scanner = Scanner.init(allocator, std.testing.io);
+        defer scanner.deinit();
+        scanner.options.scan_data_type = .INTEGER32;
+        try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+        const base_address = @intFromPtr(&memory);
+        const old_values: [16]u8 = @splat(0);
+        var matches = try MatchesArray.init(allocator, 256, 1);
+        try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len);
+        try matches.finalize();
+        scanner.matches = matches;
+        scanner.num_matches = matches.matchCount();
+
+        try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+        try scanner.matches.?.validate();
+        try std.testing.expectEqual(expected_offsets.len, scanner.matchCount());
+        for (expected_offsets, 0..) |offset, i| {
+            const record = try scanner.matchAt(i);
+            try std.testing.expectEqual(base_address + offset, record.address);
+            try std.testing.expectEqual(MatchFlags.i32b.bits(), record.raw_match_info_bits);
+        }
+    }
+
+    {
+        var scanner = Scanner.init(allocator, std.testing.io);
+        defer scanner.deinit();
+        scanner.options.alignment = 4;
+        scanner.options.scan_data_type = .INTEGER32;
+        try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+        const base_address = @intFromPtr(&memory);
+        const old_values: [16]u8 = @splat(0);
+        var matches = try MatchesArray.init(allocator, 256, 4);
+        try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len / 4);
+        try matches.finalize();
+        scanner.matches = matches;
+        scanner.num_matches = matches.matchCount();
+
+        try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+        try scanner.matches.?.validate();
+        try std.testing.expectEqual(expected_offsets.len, scanner.matchCount());
+        for (expected_offsets, 0..) |offset, i| {
+            const record = try scanner.matchAt(i);
+            try std.testing.expectEqual(base_address + offset, record.address);
+            try std.testing.expectEqual(MatchFlags.i32b.bits(), record.raw_match_info_bits);
+        }
+    }
+}
+
+test "rescanMatches: fixed integer exact dense batch preserves trailing bytes" {
+    const allocator = std.testing.allocator;
+
+    var memory: [24]u8 = @splat(1);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    const old_values: [16]u8 = @splat(0);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{
+        .int32_value = 0x01010101,
+        .uint32_value = 0x01010101,
+        .flags = MatchFlags.i32b,
+    };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(16, scanner.matchCount());
+    try std.testing.expectEqual(19, scanner.matches.?.storedByteCount());
+    try std.testing.expectEqual(0x01010101, (try scanner.matchAt(15)).stored_value.data.uint32_value);
+}
+
+test "rescanMatches: fixed integer exact full segment direct search confines hits to prior match set" {
+    const allocator = std.testing.allocator;
+
+    // 64 KiB buffer of zeros so the cache's chunk-sized read stays inside our controlled memory,
+    // no risk of stumbling on stray 0x42 bytes belonging to other process state.
+    // Place the target value 0x42 twice: once inside the 4-candidate segment and once outside it but inside the read window.
+    const buffer = try allocator.alloc(u8, MemoryCache.read_chunk_size);
+    defer allocator.free(buffer);
+    @memset(buffer, 0);
+    buffer[0] = 0x42;
+    buffer[8] = 0x42;
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, buffer);
+
+    const base_address = @intFromPtr(buffer.ptr);
+    // Full stride-1 width-4 segment of exactly 4 candidates (offsets 0..3).
+    // appendRun with len==candidate_count yields match_count==candidate_count,
+    // which is what fullSharedStrideOneWidth requires before dispatching into
+    // the indexOfPos-based rescanExactFullSegment path.
+    const old_values: [4]u8 = @splat(0);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{
+        .int32_value = 0x42,
+        .uint32_value = 0x42,
+        .flags = MatchFlags.i32b,
+    };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    // Only the in-segment 0x42 survives. indexOfPos can see the 0x42 at offset 8 in the read window,
+    // but the "h >= valid" guard inside rescanExactFullSegment rejects it because candidate index 8 was never
+    // in the prior match set.
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(null, scanner.matches.?.findMatchIndexByAddress(base_address + 8));
+}
+
+test "rescanMatches: fixed integer exact full segment direct search honors reverse endian" {
+    const allocator = std.testing.allocator;
+
+    var buffer: [8]u8 = undefined;
+    const target: u32 = 0x12345678;
+    std.mem.writeInt(u32, buffer[0..4], @byteSwap(target), .native);
+    std.mem.writeInt(u32, buffer[4..8], target, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.alignment = 4;
+    scanner.options.scan_data_type = .INTEGER32;
+    scanner.options.reverse_endianness = true;
+    try attachScannerToTestMemory(&scanner, allocator, &buffer);
+
+    const base_address = @intFromPtr(&buffer);
+    const old_values: [8]u8 = @splat(0);
+    var matches = try MatchesArray.init(allocator, 256, 4);
+    try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len / 4);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = try UserValue.parseNumber("0x12345678");
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const record = try scanner.matchAt(0);
+    try std.testing.expectEqual(base_address, record.address);
+    try std.testing.expectEqual(target, record.stored_value.data.uint32_value);
+    const current = try scanner.readNumericMatchValue(0);
+    try std.testing.expectEqual(target, current.data.uint32_value);
+    var stored: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, buffer[0..4], try scanner.storedMatchBytes(0, &stored));
+    try std.testing.expectEqual(null, scanner.matches.?.findMatchIndexByAddress(base_address + 4));
+}
+
+test "rescanMatches: FLOAT32 exact full segment search keeps both zero signs for negative-zero input" {
+    const allocator = std.testing.allocator;
+
+    // 12-byte stride-1 candidate window inside a 64 KiB scratch buffer:
+    //   bytes 0..3   : +0.0 (all zero)
+    //   bytes 4..7   : non-zero noise so intermediate windows don't match
+    //   bytes 8..11  : -0.0 (byte 11 = 0x80)
+    // With the negative-zero fix the dual-cursor rescan must emit both
+    // candidate addresses exactly once.
+    const buffer = try allocator.alloc(u8, MemoryCache.read_chunk_size);
+    defer allocator.free(buffer);
+    @memset(buffer, 0);
+    buffer[4] = 0x11;
+    buffer[5] = 0x22;
+    buffer[6] = 0x33;
+    buffer[7] = 0x44;
+    buffer[11] = 0x80;
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .FLOAT32;
+    try attachScannerToTestMemory(&scanner, allocator, buffer);
+
+    const base_address = @intFromPtr(buffer.ptr);
+    const old_values: [12]u8 = @splat(0);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_values, (MatchFlags{ .f32b = true }).bits(), old_values.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{
+        .float32_value = -0.0,
+        .flags = .{ .f32b = true },
+    };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(2, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 8, (try scanner.matchAt(1)).address);
+}
+
+test "rescanMatches: compare dense batch followed by sparse survivor" {
+    const allocator = std.testing.allocator;
+
+    const dense_candidates = MemoryCache.read_chunk_size - @sizeOf(u32) + 1;
+    const sparse_offset = dense_candidates + 8;
+    const candidate_count = dense_candidates + 17;
+    const total_bytes = candidate_count + @sizeOf(u32) - 1;
+
+    const memory = try allocator.alloc(u8, total_bytes);
+    defer allocator.free(memory);
+    @memset(memory, 2);
+    @memset(memory[0 .. dense_candidates + @sizeOf(u32) - 1], 1);
+    @memset(memory[sparse_offset .. sparse_offset + @sizeOf(u32)], 1);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, memory);
+
+    const old_values = try allocator.alloc(u8, candidate_count);
+    defer allocator.free(old_values);
+    @memset(old_values, 0);
+
+    const base_address = @intFromPtr(memory.ptr);
+    var matches = try MatchesArray.init(allocator, total_bytes * 4, 1);
+    try matches.appendRun(base_address, old_values, MatchFlags.i32b.bits(), old_values.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const user = UserValue{
+        .int32_value = 0x01010101,
+        .uint32_value = 0x01010101,
+        .flags = MatchFlags.i32b,
+    };
+    try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(dense_candidates + 1, scanner.matchCount());
+    const sparse = try scanner.matchAt(dense_candidates);
+    try std.testing.expectEqual(base_address + sparse_offset, sparse.address);
+    try std.testing.expectEqual(0x01010101, sparse.stored_value.data.uint32_value);
+}
+
+test "rescanMatches: fixed integer range narrows signed and unsigned flags" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 5, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &memory, MatchFlags.i32b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const lower = try UserValue.parseNumber("-10");
+    const upper = try UserValue.parseNumber("10");
+    try scanner.rescanMatches(.MATCHRANGE, &.{ lower, upper });
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const record = try scanner.matchAt(0);
+    try std.testing.expectEqual(base_address, record.address);
+    try std.testing.expectEqual((MatchFlags{ .s32b = true }).bits(), record.raw_match_info_bits);
+}
+
+test "rescanMatches: fixed integer increased batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &memory, MatchFlags.i32b.bits(), memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    // memory[5] = 1 changes the values seen by candidates 2..5 (their 4-byte windows cover index 5).
+    // Old value at each of those positions was 0.
+    // Every new value is positive (1, 256, 65536, 16777216 on little-endian), so all four survive MATCHINCREASED.
+    // Candidates whose windows don't touch index 5 have unchanged bytes -> diff_count stays 0 and the delta
+    // routine is skipped entirely.
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(4, scanner.matchCount());
+    try std.testing.expectEqual(base_address + 2, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 3, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(base_address + 4, (try scanner.matchAt(2)).address);
+    try std.testing.expectEqual(base_address + 5, (try scanner.matchAt(3)).address);
+    // Old raw bits had both signed and unsigned flags.
+    // Going from 0 to a positive value is "increased" under both interpretations,
+    // so both flags should survive on each match.
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), (try scanner.matchAt(3)).raw_match_info_bits);
+}
+
+test "rescanMatches: fixed integer unchanged batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &memory, MatchFlags.i32b.bits(), memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const old_used_len = scanner.matches.?.used_len;
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    // Width 4 means candidates whose window covers position 5 (indices 2..5) are removed by the batch path.
+    // Candidates 13..15 have short stored bytes and are removed by the fallback path.
+    // Survivors: 0,1,6,7,8,9,10,11,12.
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(9, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 1, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(base_address + 6, (try scanner.matchAt(2)).address);
+    try std.testing.expectEqual(base_address + 12, (try scanner.matchAt(8)).address);
+    try std.testing.expectEqual(old_used_len, scanner.matches.?.used_len);
+}
+
+test "rescanMatches: float32 changed batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .FLOAT32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    const f32_flag = (MatchFlags{ .f32b = true }).bits();
+    try matches.appendRun(base_address, &memory, f32_flag, memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    // CHANGED uses byte equality (type-agnostic).
+    // Same expectations as the INTEGER32 case: candidates whose 4-byte window covers index 5 survive.
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(4, scanner.matchCount());
+    try std.testing.expectEqual(base_address + 2, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 5, (try scanner.matchAt(3)).address);
+    try std.testing.expectEqual(f32_flag, (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: float32 unchanged batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .FLOAT32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    const f32_flag = (MatchFlags{ .f32b = true }).bits();
+    try matches.appendRun(base_address, &memory, f32_flag, memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const old_used_len = scanner.matches.?.used_len;
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    // Same survivor pattern as the INTEGER32 NOTCHANGED test.
+    // Byte equality makes float and integer behavior identical for CHANGED/NOTCHANGED.
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(9, scanner.matchCount());
+    try std.testing.expectEqual(old_used_len, scanner.matches.?.used_len);
+}
+
+test "rescanMatches: float32 increased batches full stride-one segment" {
+    const allocator = std.testing.allocator;
+
+    var memory: [16]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .FLOAT32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    const f32_flag = (MatchFlags{ .f32b = true }).bits();
+    try matches.appendRun(base_address, &memory, f32_flag, memory.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    // memory[5] = 1 with surrounding zero bytes makes every 4-byte window
+    // touching index 5 decode as a strictly-positive f32 (one normal value,
+    // three positive denormals).
+    // Old value was 0.0 for all candidates.
+    // The diff_count gate skips windows that didn't see the changed byte.
+    memory[5] = 1;
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(4, scanner.matchCount());
+    try std.testing.expectEqual(base_address + 2, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 5, (try scanner.matchAt(3)).address);
+    try std.testing.expectEqual(f32_flag, (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: fixed integer unchanged prunes in place" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.append(base_address, memory[0], MatchFlags.i32b);
+    try matches.append(base_address + 1, memory[1], MatchFlags.i32b);
+    try matches.append(base_address + 2, memory[2], .{});
+    try matches.append(base_address + 3, memory[3], .{});
+    try matches.append(base_address + 4, memory[4], .{});
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const old_used_len = scanner.matches.?.used_len;
+    memory[4] = 1;
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(0, (try scanner.matchAt(0)).stored_value.data.uint32_value);
+    try std.testing.expectEqual(old_used_len, scanner.matches.?.used_len);
+}
+
+test "rescanMatches: fixed integer changed reads old bytes across segment boundary" {
+    const allocator = std.testing.allocator;
+    const dense_segment_payload = 2 * 1024 * 1024;
+
+    const memory = try allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), dense_segment_payload + 8);
+    defer allocator.free(memory);
+    @memset(memory, 0);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER64;
+    try attachScannerToTestMemory(&scanner, allocator, memory);
+
+    const base_address = @intFromPtr(memory.ptr);
+    const match_offset = dense_segment_payload - 4;
+    const match_address = base_address + match_offset;
+
+    var matches = try MatchesArray.init(allocator, memory.len * 3, 4);
+    try matches.appendRun(base_address, memory[0..match_offset], 0, 0);
+    var old_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &old_bytes, 0x1111111122222222, .native);
+    try matches.appendRun(match_address, &old_bytes, MatchFlags.i64b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    std.mem.writeInt(u64, memory[match_offset .. match_offset + 8], 0x3333333344444444, .native);
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(match_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(0x3333333344444444, (try scanner.matchAt(0)).stored_value.data.uint64_value);
+}
+
+test "rescanMatches: fixed integer unchanged removes mismatched raw width" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.append(base_address, memory[0], MatchFlags.i16b);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(0, scanner.matchCount());
+    var iter = scanner.matches.?.iterator();
+    try std.testing.expect(iter.next() == null);
+}
+
+test "rescanMatches: fixed integer unchanged leaves empty swath iterable" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.append(base_address, memory[0], MatchFlags.i32b);
+    try matches.append(base_address + 1, memory[1], .{});
+    try matches.append(base_address + 2, memory[2], .{});
+    try matches.append(base_address + 3, memory[3], .{});
+    try matches.append(base_address + 4, memory[4], MatchFlags.i32b);
+    try matches.append(base_address + 5, memory[5], .{});
+    try matches.append(base_address + 6, memory[6], .{});
+    try matches.append(base_address + 7, memory[7], .{});
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    memory[0] = 1;
+    memory[4] = 2;
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(0, scanner.matchCount());
+    var iter = scanner.matches.?.iterator();
+    try std.testing.expect(iter.next() == null);
+}
+
+test "rescanMatches: fixed integer increased rebuilds signed and unsigned flags" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 0x80000000, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 0x7fffffff, .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.i32b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const record = try scanner.matchAt(0);
+    try std.testing.expectEqual((MatchFlags{ .u32b = true }).bits(), record.raw_match_info_bits);
+    try std.testing.expectEqual(0x80000000, record.stored_value.data.uint32_value);
+}
+
+test "rescanMatches: fixed integer decreased rebuilds signed and unsigned flags" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 0x80000000, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 0x7fffffff, .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.i32b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHDECREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const record = try scanner.matchAt(0);
+    try std.testing.expectEqual((MatchFlags{ .s32b = true }).bits(), record.raw_match_info_bits);
+    try std.testing.expectEqual(std.math.minInt(i32), record.stored_value.data.int32_value);
+}
+
+test "rescanMatches: fixed integer increaseby and decreaseby use user delta" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 15, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 10, .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.i32b.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const delta = UserValue{
+        .int32_value = 5,
+        .uint32_value = 5,
+        .flags = MatchFlags.i32b,
+    };
+    try scanner.rescanMatches(.MATCHINCREASEDBY, &.{delta});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+
+    std.mem.writeInt(u32, &memory, 10, .native);
+    try scanner.rescanMatches(.MATCHDECREASEDBY, &.{delta});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(MatchFlags.i32b.bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyinteger reverse-endian increased decodes old bytes symmetrically" {
+    const allocator = std.testing.allocator;
+
+    var memory: [2]u8 = undefined;
+    const current_value: u16 = 0x0100;
+    std.mem.writeInt(u16, &memory, @byteSwap(current_value), .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    scanner.options.reverse_endianness = true;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [2]u8 = undefined;
+    const old_value: u16 = 0x0080;
+    std.mem.writeInt(u16, &old_bytes, @byteSwap(old_value), .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, (MatchFlags{ .u16b = true }).bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .u16b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyinteger reverse-endian increaseby decodes old bytes symmetrically" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    const current_value: u32 = 15;
+    std.mem.writeInt(u32, &memory, @byteSwap(current_value), .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    scanner.options.reverse_endianness = true;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    const old_value: u32 = 10;
+    std.mem.writeInt(u32, &old_bytes, @byteSwap(old_value), .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, (MatchFlags{ .u32b = true }).bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const delta = UserValue{
+        .uint32_value = 5,
+        .flags = .{ .u32b = true },
+    };
+    try scanner.rescanMatches(.MATCHINCREASEDBY, &.{delta});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .u32b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyfloat reverse-endian increased decodes old bytes symmetrically" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    const current_value: f32 = 2.0;
+    const current_bits: u32 = @bitCast(current_value);
+    std.mem.writeInt(u32, &memory, @byteSwap(current_bits), .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYFLOAT;
+    scanner.options.reverse_endianness = true;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    const old_value: f32 = 1.0;
+    const old_bits: u32 = @bitCast(old_value);
+    std.mem.writeInt(u32, &old_bytes, @byteSwap(old_bits), .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, (MatchFlags{ .f32b = true }).bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .f32b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyfloat delta full segment gates unchanged f32 window" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = undefined;
+    var old_bytes: [8]u8 = undefined;
+    if (builtin.cpu.arch.endian() == .little) {
+        const old_value: f64 = 1.0;
+        const current_value: f64 = 2.0;
+        std.mem.writeInt(u64, &old_bytes, @bitCast(old_value), .native);
+        std.mem.writeInt(u64, &memory, @bitCast(current_value), .native);
+    } else {
+        std.mem.writeInt(u64, &old_bytes, 0x3ff0000000000000, .native);
+        std.mem.writeInt(u64, &memory, 0x3ff0000000000001, .native);
+    }
+    try std.testing.expectEqualSlices(u8, old_bytes[0..4], memory[0..4]);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYFLOAT;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.float.bits(), old_bytes.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .f64b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyfloat unchanged uses bit equality for identical NaN" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    const nan_bits: u32 = 0x7fc00001;
+    std.mem.writeInt(u32, &memory, nan_bits, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYFLOAT;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, nan_bits, .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, (MatchFlags{ .f32b = true }).bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .f32b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyinteger changed preserves dual signed and unsigned flags" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 200, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 100, .native);
+
+    const stored_flags = MatchFlags{ .s32b = true, .u32b = true };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, stored_flags.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(stored_flags.bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anyinteger notchanged preserves matching stored sub-width" {
+    const allocator = std.testing.allocator;
+
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 0xdeadbeef, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    // Stored as u16b: only the low two bytes are checked for equality.
+    // Memory matches those two bytes so the candidate is preserved at its sub-width.
+    var old_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &old_bytes, @truncate(0xdeadbeef), .native);
+
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, (MatchFlags{ .u16b = true }).bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHNOTCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .u16b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "fullSharedStrideOneWidth: accepts ANY sub-width shared segments" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    const old_values: [8]u8 = @splat(0);
+    try matches.appendRun(0x1000, &old_values, MatchFlags.i16b.bits(), old_values.len);
+    try matches.finalize();
+
+    var segments = matches.segmentIterator();
+    const segment = segments.next().?;
+    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .ANYINTEGER, 8).?);
+    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .ANYNUMBER, 8).?);
+    try std.testing.expectEqual(2, fullSharedStrideOneWidth(segment, .INTEGER16, 2).?);
+    try std.testing.expect(fullSharedStrideOneWidth(segment, .INTEGER64, 8) == null);
+}
+
+test "rescanMatches: anynumber increased keeps integer survivor and drops NaN float flag" {
+    const allocator = std.testing.allocator;
+
+    // Both old and current bytes are valid qNaN bit patterns (0x7fc0...) that also happen to be valid integers.
+    // Integer-wise current > old.
+    // Float-wise both are NaN so any ordering compares false.
+    // INCREASED should keep u32b and drop f32b, which proves the ANYNUMBER delta kernel unions int and float
+    // independently per the stored flags.
+    var memory: [4]u8 = undefined;
+    std.mem.writeInt(u32, &memory, 0x7fc00002, .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYNUMBER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var old_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_bytes, 0x7fc00001, .native);
+
+    const stored_flags = MatchFlags{ .u32b = true, .f32b = true };
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, stored_flags.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual((MatchFlags{ .u32b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "rescanMatches: anynumber delta full segment gates unchanged sub-width windows" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = undefined;
+    var old_bytes: [8]u8 = undefined;
+    if (builtin.cpu.arch.endian() == .little) {
+        const old_value: f64 = 1.0;
+        const current_value: f64 = 2.0;
+        std.mem.writeInt(u64, &old_bytes, @bitCast(old_value), .native);
+        std.mem.writeInt(u64, &memory, @bitCast(current_value), .native);
+    } else {
+        std.mem.writeInt(u64, &old_bytes, 0x3ff0000000000000, .native);
+        std.mem.writeInt(u64, &memory, 0x3ff0000000000001, .native);
+    }
+    try std.testing.expectEqualSlices(u8, old_bytes[0..4], memory[0..4]);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYNUMBER;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &old_bytes, MatchFlags.all.bits(), old_bytes.len);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    try scanner.rescanMatches(.MATCHINCREASED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    const flags: MatchFlags = @bitCast((try scanner.matchAt(0)).raw_match_info_bits);
+    try std.testing.expect(!flags.u8b);
+    try std.testing.expect(!flags.s8b);
+    try std.testing.expect(!flags.u16b);
+    try std.testing.expect(!flags.s16b);
+    try std.testing.expect(!flags.u32b);
+    try std.testing.expect(!flags.s32b);
+    try std.testing.expect(!flags.f32b);
+    try std.testing.expect(flags.u64b);
+    try std.testing.expect(flags.s64b);
+    try std.testing.expect(flags.f64b);
+}
+
+test "rescanMatches: stores non-surviving overlap as trailing bytes" {
+    const allocator = std.testing.allocator;
+
+    var memory: [8]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.append(base_address, memory[0], MatchFlags.i32b);
+    try matches.append(base_address + 1, memory[1], MatchFlags.i32b);
+    try matches.append(base_address + 2, memory[2], .{});
+    try matches.append(base_address + 3, memory[3], .{});
+    try matches.append(base_address + 4, memory[4], .{});
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    memory[0] = 1;
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(1, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(base_address + 1));
+    try std.testing.expectEqual(4, scanner.matches.?.storedByteCount());
+    try std.testing.expectEqual(1, (try scanner.matchAt(0)).stored_value.data.uint32_value);
+}
+
+test "rescanMatches: carries trailing bytes across non-surviving matches" {
+    const allocator = std.testing.allocator;
+
+    var memory: [12]u8 = @splat(0);
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .INTEGER32;
+    try attachScannerToTestMemory(&scanner, allocator, &memory);
+
+    const base_address = @intFromPtr(&memory);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    for (memory, 0..) |byte, i| {
+        const flags = if (i == 0 or i == 2 or i == 4 or i == 8) MatchFlags.i32b else MatchFlags{};
+        try matches.append(base_address + i, byte, flags);
+    }
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    memory[0] = 1;
+    memory[8] = 2;
+    try scanner.rescanMatches(.MATCHCHANGED, &.{});
+
+    try scanner.matches.?.validate();
+    try std.testing.expectEqual(2, scanner.matchCount());
+    try std.testing.expectEqual(base_address, (try scanner.matchAt(0)).address);
+    try std.testing.expectEqual(base_address + 8, (try scanner.matchAt(1)).address);
+    try std.testing.expectEqual(12, scanner.matches.?.storedByteCount());
+    try std.testing.expectEqual(1, (try scanner.matchAt(0)).stored_value.data.uint32_value);
+    try std.testing.expectEqual(2, (try scanner.matchAt(1)).stored_value.data.uint32_value);
 }
 
 test "removeRegionById: prunes affected matches and shrinks region list" {
@@ -1555,7 +5028,7 @@ test "removeRegionById: prunes affected matches and shrinks region list" {
         .filename = try std.testing.allocator.dupe(u8, "[heap]"),
     };
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x1000, 0xaa, .{ .u8b = true, .s8b = true });
     try matches.append(0x1008, 0xbb, .{ .u8b = true, .s8b = true });
     try matches.append(0x2000, 0xcc, .{ .u8b = true, .s8b = true });
@@ -1574,28 +5047,28 @@ test "removeRegionById: prunes affected matches and shrinks region list" {
     try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1008));
 }
 
-fn expectStoredByteRangeCleared(matches: *const MatchesArray, start_address: usize, len: usize) !void {
+fn expectNoMatchBitsInRange(matches: *const MatchesArray, start_address: usize, len: usize) !void {
     var offset: usize = 0;
     while (offset < len) : (offset += 1) {
         const address = start_address + offset;
+        var found = false;
         var iter = matches.storedByteIterator();
         while (iter.next()) |stored| {
             if (stored.address != address) continue;
-            try std.testing.expectEqual(0, stored.old_value);
             try std.testing.expectEqual(0, stored.raw_match_info_bits);
+            found = true;
             break;
-        } else {
-            return error.TestUnexpectedResult;
         }
+        try std.testing.expect(found);
     }
 }
 
-test "removeMatchByIndex: removes full stored match record" {
+test "removeMatchByIndex: clears selected match bits" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
     scanner.options.scan_data_type = .INTEGER32;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x1000, 0x78, .{ .u32b = true, .s32b = true });
     try matches.append(0x1001, 0x56, .{});
     try matches.append(0x1002, 0x34, .{});
@@ -1612,20 +5085,20 @@ test "removeMatchByIndex: removes full stored match record" {
     try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
     try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
     try std.testing.expectEqual(0x2000, (try scanner.matchAt(0)).address);
-    try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
+    try expectNoMatchBitsInRange(&scanner.matches.?, 0x1000, 4);
 }
 
-test "removeMatchByIndex: uses stored match span instead of current scan data type" {
+test "removeMatchByIndex: ignores current scan data type" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
     scanner.options.scan_data_type = .STRING;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x1000, 0x78, .{ .u32b = true, .s32b = true });
     try matches.append(0x1001, 0x56, .{});
     try matches.append(0x1002, 0x34, .{});
     try matches.append(0x1003, 0x12, .{});
-    try matches.append(0x2000, 0xaa, @bitCast(@as(u16, 3)));
+    try matches.appendRaw(0x2000, 0xaa, 3);
     try matches.append(0x2001, 0xbb, .{});
     try matches.append(0x2002, 0xcc, .{});
     try matches.finalize();
@@ -1637,7 +5110,7 @@ test "removeMatchByIndex: uses stored match span instead of current scan data ty
     try std.testing.expect(removed_numeric);
     try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
     try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
-    try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
+    try expectNoMatchBitsInRange(&scanner.matches.?, 0x1000, 4);
 
     scanner.options.scan_data_type = .INTEGER64;
     const removed_variable = try scanner.removeMatchByIndex(0);
@@ -1645,15 +5118,15 @@ test "removeMatchByIndex: uses stored match span instead of current scan data ty
     try std.testing.expectEqual(0, scanner.matchCount());
     try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x2000));
     try std.testing.expect(!scanner.hasMatches());
-    try expectStoredByteRangeCleared(&scanner.matches.?, 0x2000, 3);
+    try expectNoMatchBitsInRange(&scanner.matches.?, 0x2000, 3);
 }
 
-test "removeMatchByAddress: removes full stored match record" {
+test "removeMatchByAddress: clears selected match bits" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
     scanner.options.scan_data_type = .INTEGER32;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     try matches.append(0x1000, 0x78, .{ .u32b = true, .s32b = true });
     try matches.append(0x1001, 0x56, .{});
     try matches.append(0x1002, 0x34, .{});
@@ -1670,19 +5143,19 @@ test "removeMatchByAddress: removes full stored match record" {
     try std.testing.expectEqual(null, scanner.findMatchIndexByAddress(0x1000));
     try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x2000));
     try std.testing.expectEqual(0x2000, (try scanner.matchAt(0)).address);
-    try expectStoredByteRangeCleared(&scanner.matches.?, 0x1000, 4);
+    try expectNoMatchBitsInRange(&scanner.matches.?, 0x1000, 4);
 }
 
-test "removeMatchByIndex: removes full variable-length stored match record" {
+test "removeMatchByIndex: clears selected variable-length match bits" {
     var scanner = Scanner.init(std.testing.allocator, std.testing.io);
     defer scanner.deinit();
     scanner.options.scan_data_type = .BYTEARRAY;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
-    try matches.append(0x3000, 0xaa, @bitCast(@as(u16, 3)));
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try matches.appendRaw(0x3000, 0xaa, 3);
     try matches.append(0x3001, 0xbb, .{});
     try matches.append(0x3002, 0xcc, .{});
-    try matches.append(0x4000, 0xdd, @bitCast(@as(u16, 2)));
+    try matches.appendRaw(0x4000, 0xdd, 2);
     try matches.append(0x4001, 0xee, .{});
     try matches.finalize();
 
@@ -1696,7 +5169,7 @@ test "removeMatchByIndex: removes full variable-length stored match record" {
     try std.testing.expectEqual(0, scanner.findMatchIndexByAddress(0x4000));
     var buf: [2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xee }, try scanner.storedMatchBytes(0, &buf));
-    try expectStoredByteRangeCleared(&scanner.matches.?, 0x3000, 3);
+    try expectNoMatchBitsInRange(&scanner.matches.?, 0x3000, 3);
 }
 
 test "removeRegionById: is a no-op for missing id" {
@@ -1744,7 +5217,6 @@ test "removeRegionsByIdSet: is a no-op for empty ids and missing ids" {
 
 test "initialScanChunkDecision: chooses scan limit and region stop from read shape" {
     const Case = struct {
-        name: []const u8,
         region_offset: usize,
         region_size: usize,
         bytes_read: usize,
@@ -1756,7 +5228,6 @@ test "initialScanChunkDecision: chooses scan limit and region stop from read sha
 
     const cases = [_]Case{
         .{
-            .name = "short read scans all bytes and stops region",
             .region_offset = 0x200,
             .region_size = 0x1000,
             .bytes_read = 0x80,
@@ -1766,7 +5237,6 @@ test "initialScanChunkDecision: chooses scan limit and region stop from read sha
             .expected_stop_region = true,
         },
         .{
-            .name = "full middle read leaves trailing overlap for next chunk",
             .region_offset = 0x200,
             .region_size = 0x1000,
             .bytes_read = 0x100,
@@ -1776,7 +5246,6 @@ test "initialScanChunkDecision: chooses scan limit and region stop from read sha
             .expected_stop_region = false,
         },
         .{
-            .name = "full end read scans through region end",
             .region_offset = 0xf00,
             .region_size = 0x1000,
             .bytes_read = 0x100,
@@ -1786,7 +5255,6 @@ test "initialScanChunkDecision: chooses scan limit and region stop from read sha
             .expected_stop_region = false,
         },
         .{
-            .name = "read no larger than overlap is scanned instead of underflowing",
             .region_offset = 0x200,
             .region_size = 0x1000,
             .bytes_read = 8,
@@ -1822,13 +5290,11 @@ test "effectiveAlignment: resolves auto alignment by data type" {
 }
 
 test "scanChunkIntoMatches: records numeric matches and trailing bytes" {
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     defer matches.deinit();
 
     const user = try UserValue.parseNumber("1");
-    const routine = scanroutines.chooseRoutine(.INTEGER16, .MATCHEQUALTO, &.{user}, false).?;
     const prepared = PreparedScan{
-        .routine = routine,
         .match_type = .MATCHEQUALTO,
         .data_type = .INTEGER16,
     };
@@ -1837,27 +5303,27 @@ test "scanChunkIntoMatches: records numeric matches and trailing bytes" {
     var required_extra: usize = 0;
     var num_matches: usize = 0;
 
-    try scanChunkIntoMatches(&matches, prepared, &.{user}, 0x1000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER16, .MATCHEQUALTO, false), &.{user}, 0x1000, &chunk, chunk.len, 1, &required_extra, &num_matches);
     try matches.finalize();
 
     try std.testing.expectEqual(2, num_matches);
     try std.testing.expectEqual(2, matches.matchCount());
-    try std.testing.expectEqual(0x1000, matches.nthMatch(0).?.remoteAddress(&matches));
-    try std.testing.expectEqual(0x1004, matches.nthMatch(1).?.remoteAddress(&matches));
-    try std.testing.expectEqual(0, matches.rawMatchInfoBits(0, 1));
+    try std.testing.expectEqual(0x1000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x1004, matches.nthMatch(1).?.address);
+    var iter = matches.storedByteIterator();
+    _ = iter.next();
+    try std.testing.expectEqual(0, iter.next().?.raw_match_info_bits);
     try std.testing.expectEqual(0, required_extra);
     var stored: [2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0 }, matches.dataToBytes(0, 0, 2, &stored));
 }
 
 test "scanChunkIntoMatches: honors alignment gating" {
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
     defer matches.deinit();
 
     const user = try UserValue.parseNumber("1");
-    const routine = scanroutines.chooseRoutine(.INTEGER16, .MATCHEQUALTO, &.{user}, false).?;
     const prepared = PreparedScan{
-        .routine = routine,
         .match_type = .MATCHEQUALTO,
         .data_type = .INTEGER16,
     };
@@ -1873,30 +5339,1000 @@ test "scanChunkIntoMatches: honors alignment gating" {
     var required_extra: usize = 0;
     var num_matches: usize = 0;
 
-    try scanChunkIntoMatches(&matches, prepared, &.{user}, 0x2000, &chunk, chunk.len, 2, &required_extra, &num_matches);
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER16, .MATCHEQUALTO, false), &.{user}, 0x2000, &chunk, chunk.len, 2, &required_extra, &num_matches);
     try matches.finalize();
 
     try std.testing.expectEqual(1, num_matches);
     try std.testing.expectEqual(1, matches.matchCount());
-    try std.testing.expectEqual(0x2004, matches.nthMatch(0).?.remoteAddress(&matches));
+    try std.testing.expectEqual(0x2004, matches.nthMatch(0).?.address);
     try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x2001));
     try std.testing.expectEqual(0, required_extra);
 }
 
-test "serializeWriteValue: encodes little-endian integer32" {
+test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO at alignment 4 stores trailing bytes per aligned match and skips gaps" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 4);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("1");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // Two INTEGER32 matches for value 1 (LE = 1,0,0,0) at offsets 0 and 8,
+    // separated by a 4-byte gap of non-matching bytes at offset 4.
+    // With candidate stepping at alignment 4 only offsets 0, 4, 8 invoke the kernel.
+    // The gap bytes 4-7 sit outside any match's pending window and must not be stored.
+    const chunk = [_]u8{ 1, 0, 0, 0, 9, 9, 9, 9, 1, 0, 0, 0 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x4000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0x4000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x4008, matches.nthMatch(1).?.address);
+    // The gap candidates at 0x4004 were exercised by the kernel and rejected (no spurious match registered there).
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x4004));
+    try std.testing.expectEqual(0, required_extra);
+    // Each match's 4 trailing bytes reconstruct the original INTEGER32 LE bytes for value 1.
+    var stored: [4]u8 = undefined;
+    const loc0 = matches.nthMatch(0).?;
+    const loc1 = matches.nthMatch(1).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0 }, matches.dataToBytes(loc0.swath_offset, loc0.index, 4, &stored));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0 }, matches.dataToBytes(loc1.swath_offset, loc1.index, 4, &stored));
+}
+
+test "scanChunkIntoMatches: numeric MATCHEQUALTO carries chunk-boundary trailing bytes across calls" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("1");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // First chunk has an INTEGER32 match for value 1 at offset 3 (the value's LE bytes span offsets 3..7).
+    // scan_limit=4 means only the match byte at offset 3 is part of this chunk's window.
+    // Bytes 4..7 are overlap-only.
+    // required_extra should be set to 3 on exit so the next chunk records them as trailing bytes.
+    const first_chunk = [_]u8{ 9, 9, 9, 1, 0, 0, 0 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x5000, &first_chunk, 4, 1, &required_extra, &num_matches);
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(3, required_extra);
+
+    // Second chunk starts at 0x5004 (right after first chunk's scan_limit).
+    // Its first 3 bytes are the carried trailing bytes for the prior match
+    // and must be stored with raw_bits=0. No new matches in this chunk.
+    const second_chunk = [_]u8{ 0, 0, 0, 9, 9, 9 };
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x5004, &second_chunk, second_chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0x5003, matches.nthMatch(0).?.address);
+    // 1 match byte + 3 trailing bytes carried across the boundary = 4 stored.
+    try std.testing.expectEqual(4, matches.storedByteCount());
+    try std.testing.expectEqual(0, required_extra);
+    var stored: [4]u8 = undefined;
+    const loc = matches.nthMatch(0).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0 }, matches.dataToBytes(loc.swath_offset, loc.index, 4, &stored));
+}
+
+test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO direct search records overlapping matches at align 1" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0x01010101");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // 6 consecutive 0x01 bytes contain INTEGER32 0x01010101 at offsets 0, 1, 2 (overlapping).
+    // The indexOfPos-based path must advance by hit+1 to find every overlap and
+    // not skip past matches like a stride-of-width loop would.
+    const chunk = [_]u8{ 1, 1, 1, 1, 1, 1, 9 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x1000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0x1000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x1001, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(0x1002, matches.nthMatch(2).?.address);
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO direct search honors alignment 4" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 4);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0x42");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // INTEGER32 needle [0x42, 0, 0, 0] appears at offsets 0 (aligned), 5 (unaligned), and 12 (aligned).
+    // The alignment gate must reject the h=5 hit even though indexOfPos finds it.
+    const chunk = [_]u8{ 0x42, 0, 0, 0, 9, 0x42, 0, 0, 0, 9, 9, 9, 0x42, 0, 0, 0 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x2000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(0x2000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x200c, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x2005));
+}
+
+test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO direct search honors reverse endian" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 4);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0x12345678");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+        .reverse_endianness = true,
+    };
+
+    var chunk: [8]u8 = undefined;
+    const target: u32 = 0x12345678;
+    std.mem.writeInt(u32, chunk[0..4], @byteSwap(target), .native);
+    std.mem.writeInt(u32, chunk[4..8], target, .native);
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, true), &.{user}, 0x2400, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(0x2400, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(null, matches.findMatchIndexByAddress(0x2404));
+}
+
+test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO with disagreeing signed and unsigned fields falls back to general kernel" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    // A contrived UserValue where int32_value and uint32_value disagree.
+    // The needle path cannot represent both interpretations as a single byte pattern.
+    // Without the fix it would silently pick uint32_value and still record both flags.
+    // The fix returns null from the needle serializer so the general kernel runs and
+    // only records the flag whose value actually matches the memory.
+    const user = UserValue{
+        .int32_value = -1,
+        .uint32_value = 42,
+        .flags = .{ .s32b = true, .u32b = true },
+    };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // Memory contains the bit pattern of 42 (only the u32 interpretation matches).
+    const chunk = [_]u8{ 0x2A, 0, 0, 0 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x4000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(1, num_matches);
+    const m = matches.nthMatch(0).?;
+    try std.testing.expectEqual(0x4000, m.address);
+    const recorded: MatchFlags = @bitCast(m.raw_match_info_bits);
+    try std.testing.expect(recorded.u32b);
+    try std.testing.expect(!recorded.s32b);
+}
+
+test "scanChunkIntoMatches: FLOAT32 MATCHEQUALTO zero matches positive and negative zero bit patterns" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    // parseNumber("0") sets f32b/f64b with float32_value = 0.0.
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    // +0.0 bit pattern = 0x00000000 (bytes 0,0,0,0).
+    // -0.0 bit pattern = 0x80000000 (LE bytes 0,0,0,0x80).
+    // Both compare equal to 0.0 under "==", so the dual-needle path should
+    // register matches at offsets 0 (+0.0), 4 (-0.0), and 8 (+0.0).
+    var chunk: [12]u8 = @splat(0);
+    chunk[7] = 0x80;
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x3000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0x3000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x3004, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(0x3008, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: FLOAT32 MATCHEQUALTO negative-zero input still matches both signs once" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    // User passes -0.0 explicitly (parseNumber("0") would give +0.0).
+    // Under "==" semantics, -0.0 still equals both +0.0 and -0.0, so the
+    // serializer must emit BOTH bit patterns regardless of which sign the user supplied.
+    // If primary and secondary needles collapsed to the same pattern,
+    // the dual-cursor loop would emit the same address twice.
+    const user = UserValue{
+        .float32_value = -0.0,
+        .flags = .{ .f32b = true },
+    };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    var chunk: [12]u8 = @splat(0);
+    chunk[7] = 0x80;
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x3000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0x3000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x3004, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(0x3008, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: FLOAT64 MATCHEQUALTO negative-zero input still matches both signs once" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    const user = UserValue{
+        .float64_value = -0.0,
+        .flags = .{ .f64b = true },
+    };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT64,
+    };
+
+    // 24 bytes: +0.0 at offset 0, -0.0 at offset 8, +0.0 at offset 16.
+    var chunk: [24]u8 = @splat(0);
+    chunk[15] = 0x80; // MSB of -0.0 little-endian f64 bit pattern
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT64, .MATCHEQUALTO, false), &.{user}, 0x3000, &chunk, chunk.len, 8, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0x3000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x3008, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(0x3010, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: FLOAT32 MATCHEQUALTO NaN never matches" {
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    defer matches.deinit();
+
+    const nan_value = std.math.nan(f32);
+    const user = UserValue{
+        .float32_value = nan_value,
+        .flags = .{ .f32b = true },
+    };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    // Chunk holds the same NaN bit pattern. Under "==" semantics, NaN never equals anything (including itself),
+    // so the direct-search path must serialize-to-null and the fallback kernel must reject the candidate.
+    var chunk: [4]u8 = undefined;
+    const nan_bits: u32 = @bitCast(nan_value);
+    std.mem.writeInt(u32, &chunk, nan_bits, .native);
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x4000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try std.testing.expectEqual(0, num_matches);
+}
+
+test "scanChunkIntoMatches: FLOAT32 MATCHEQUALTO zero burst-appends a long zero region at align 1" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    // 64 zero bytes: the +0.0 needle is [0,0,0,0] and matches at every offset 0..=60 (61 overlapping matches).
+    // The dual-cursor direct-search loop must collapse these into one appendRun call rather than 61 appendRaw calls.
+    // No -0.0 (0x80 byte) anywhere, so the secondary cursor is null at start
+    // and stays null, which exercises the consumed_primary burst path in isolation.
+    var chunk: [64]u8 = @splat(0);
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x4000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+    try matches.validate();
+
+    try std.testing.expectEqual(61, num_matches);
+    try std.testing.expectEqual(0x4000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x4000 + 60, matches.nthMatch(60).?.address);
+    // Every emitted match must keep the same +0.0 raw_bits.
+    const first: MatchFlags = @bitCast(matches.nthMatch(0).?.raw_match_info_bits);
+    const last: MatchFlags = @bitCast(matches.nthMatch(60).?.raw_match_info_bits);
+    try std.testing.expect(first.f32b);
+    try std.testing.expect(last.f32b);
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: FLOAT32 zero burst followed by isolated -0.0 keeps dual-cursor invariant" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    // Layout (28 bytes total, align 1):
+    //   offset 0..15: zeros            -> +0.0 matches at 0..=12 (13 matches)
+    //   offset 16..19: stop byte 0xCC at 16, then zeros (no match alignment)
+    //   offset 20..23: -0.0 little-endian -> {0,0,0,0x80}, matches secondary
+    //   offset 24..27: zeros            -> +0.0 match at 24 only (chunk ends)
+    // With needle.primary.len = 4, scan_limit = chunk.len = 28, the last valid start offset is 24.
+    // Verifies (a) burst at the front, (b) secondary still discovered after burst advances hit_primary past it,
+    // (c) trailing +0.0 singleton after the secondary still emits.
+    var chunk: [28]u8 = @splat(0);
+    chunk[16] = 0xCC;
+    chunk[23] = 0x80;
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x5000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+    try matches.validate();
+
+    // Expected matches:
+    //   +0.0 burst:  0,1,2,3,4,5,6,7,8,9,10,11,12   (13)
+    //   +0.0 single: 17,18,19                       (3) - zeros after 0xCC
+    //   -0.0 single: 20                              (1) - [0,0,0,0x80]
+    //   +0.0 single: 24                              (1) - final {0,0,0,0}
+    // Total: 18.
+    try std.testing.expectEqual(18, num_matches);
+    try std.testing.expectEqual(0x5000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x5000 + 12, matches.nthMatch(12).?.address);
+    try std.testing.expectEqual(0x5000 + 17, matches.nthMatch(13).?.address);
+    try std.testing.expectEqual(0x5000 + 20, matches.nthMatch(16).?.address);
+    try std.testing.expectEqual(0x5000 + 24, matches.nthMatch(17).?.address);
+}
+
+test "scanChunkIntoMatches: INTEGER32 zero search records every overlapping match at align 1" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER32,
+    };
+
+    // 16 zero bytes followed by a non-zero sentinel.
+    // INTEGER32 zero needle is [0,0,0,0]; with chunk[16] = 0xFF, the last valid start position is 12.
+    // So 13 overlapping matches at offsets 0..=12.
+    var chunk: [17]u8 = @splat(0);
+    chunk[16] = 0xFF;
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHEQUALTO, false), &.{user}, 0x6000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+    try matches.validate();
+
+    try std.testing.expectEqual(13, num_matches);
+    try std.testing.expectEqual(0x6000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x6000 + 12, matches.nthMatch(12).?.address);
+}
+
+test "scanChunkIntoMatches: FLOAT32 zero burst-appends aligned run at align 4" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 4);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .FLOAT32,
+    };
+
+    var chunk: [64]u8 = @splat(0);
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.FLOAT32, .MATCHEQUALTO, false), &.{user}, 0x7000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+    try matches.validate();
+
+    try std.testing.expectEqual(16, num_matches);
+    try std.testing.expectEqual(0x7000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x7000 + 60, matches.nthMatch(15).?.address);
+    try std.testing.expectEqual(64, matches.storedByteCount());
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: INTEGER64 zero burst at align 4 preserves final trailing bytes" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 4);
+    defer matches.deinit();
+
+    const user = try UserValue.parseNumber("0");
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .INTEGER64,
+    };
+
+    var chunk: [25]u8 = @splat(0);
+    chunk[24] = 0xff;
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER64, .MATCHEQUALTO, false), &.{user}, 0x8000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+    try matches.validate();
+
+    try std.testing.expectEqual(5, num_matches);
+    try std.testing.expectEqual(0x8000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x8000 + 16, matches.nthMatch(4).?.address);
+    try std.testing.expectEqual(24, matches.storedByteCount());
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: bulk MATCHANY records align-1 numeric run" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .INTEGER32,
+    };
+
+    const chunk = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHANY, false), &.{}, 0x3000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(13, num_matches);
+    try std.testing.expectEqual(13, matches.matchCount());
+    try std.testing.expectEqual(16, matches.storedByteCount());
+    try std.testing.expectEqual(0, required_extra);
+    try std.testing.expectEqual(0x300c, matches.nthMatch(12).?.address);
+}
+
+test "scanChunkIntoMatches: bulk MATCHANY preserves align-4 numeric run" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 4);
+    defer matches.deinit();
+
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .INTEGER32,
+    };
+
+    const chunk = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHANY, false), &.{}, 0x4000, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(4, num_matches);
+    try std.testing.expectEqual(4, matches.matchCount());
+    try std.testing.expectEqual(16, matches.storedByteCount());
+    try std.testing.expectEqual(0, required_extra);
+    try std.testing.expectEqual(0x400c, matches.nthMatch(3).?.address);
+}
+
+test "scanChunkIntoMatches: bulk MATCHANY skips unaligned leading bytes" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 4);
+    defer matches.deinit();
+
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .INTEGER32,
+    };
+
+    const chunk = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.INTEGER32, .MATCHANY, false), &.{}, 0x4001, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(3, matches.matchCount());
+    try std.testing.expectEqual(12, matches.storedByteCount());
+    try std.testing.expectEqual(0x4004, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x400c, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: ANYNUMBER MATCHANY bulk run preserves tail widths" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .ANYNUMBER,
+    };
+
+    const chunk = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, scanroutines.pickInitialNumericKernel(.ANYNUMBER, .MATCHANY, false), &.{}, 0x5000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(10, num_matches);
+    try std.testing.expectEqual(10, matches.matchCount());
+    try std.testing.expectEqual(MatchFlags.all.bits(), matches.nthMatch(0).?.raw_match_info_bits);
+    try std.testing.expectEqual(MatchFlags.all.bits(), matches.nthMatch(2).?.raw_match_info_bits);
+    try std.testing.expectEqual((MatchFlags{ .u8b = true, .s8b = true }).bits(), matches.nthMatch(9).?.raw_match_info_bits);
+}
+
+test "scanChunkIntoMatches: string exact preserves overlapping matches" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = UserValue{ .string_value = "ana" };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .STRING,
+    };
+
+    const chunk = "banana";
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0x6000, chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0x6001, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x6003, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(5, matches.storedByteCount());
+    var first: [3]u8 = undefined;
+    var second: [3]u8 = undefined;
+    const first_match = matches.nthMatch(0).?;
+    const second_match = matches.nthMatch(1).?;
+    try std.testing.expectEqualSlices(u8, "ana", matches.dataToBytes(first_match.swath_offset, first_match.index, 3, &first));
+    try std.testing.expectEqualSlices(u8, "ana", matches.dataToBytes(second_match.swath_offset, second_match.index, 3, &second));
+}
+
+test "scanChunkIntoMatches: string exact respects alignment" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = UserValue{ .string_value = "aba" };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .STRING,
+    };
+
+    const chunk = "xabaaba";
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0x7000, chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0x7004, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: string exact carries chunk-boundary trailing bytes" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const user = UserValue{ .string_value = "abcd" };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .STRING,
+    };
+
+    const first_chunk = "xxabcd";
+    const second_chunk = "cdzz";
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0x8000, first_chunk, 4, 1, &required_extra, &num_matches);
+    try std.testing.expectEqual(2, required_extra);
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0x8004, second_chunk, second_chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0x8002, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0, required_extra);
+    var stored: [4]u8 = undefined;
+    const location = matches.nthMatch(0).?;
+    try std.testing.expectEqualSlices(u8, "abcd", matches.dataToBytes(location.swath_offset, location.index, 4, &stored));
+}
+
+test "scanChunkIntoMatches: bytearray exact preserves overlapping matches" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const pattern = [_]u8{ 0xaa, 0xbb, 0xaa };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const chunk = [_]u8{ 0xaa, 0xbb, 0xaa, 0xbb, 0xaa };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0x9000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0x9000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0x9002, matches.nthMatch(1).?.address);
+    var first: [3]u8 = undefined;
+    var second: [3]u8 = undefined;
+    const first_match = matches.nthMatch(0).?;
+    const second_match = matches.nthMatch(1).?;
+    try std.testing.expectEqualSlices(u8, &pattern, matches.dataToBytes(first_match.swath_offset, first_match.index, 3, &first));
+    try std.testing.expectEqualSlices(u8, &pattern, matches.dataToBytes(second_match.swath_offset, second_match.index, 3, &second));
+}
+
+test "scanChunkIntoMatches: bytearray exact honors wildcard predicate" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const pattern = [_]u8{ 0xaa, 0x00, 0xcc };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const chunk = [_]u8{ 0xaa, 0x77, 0xcc, 0xaa, 0x88, 0xcd };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xa000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0xa000, matches.nthMatch(0).?.address);
+}
+
+test "scanChunkIntoMatches: bytearray wildcard slots require zero pattern bytes" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const pattern = [_]u8{ 0xaa, 0xff, 0xcc };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const chunk = [_]u8{ 0xaa, 0x77, 0xcc };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xb000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(0, num_matches);
+    try std.testing.expectEqual(0, matches.matchCount());
+}
+
+test "scanChunkIntoMatches: bytearray exact picks longest fixed run when it's not at index 0" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    // Pattern: [0x00, WILD, 0xDE, 0xAD, 0xBE, 0xEF].
+    // The longest contiguous FIXED run is [0xDE, 0xAD, 0xBE, 0xEF] at index 2,
+    // so the anchor search should find the full occurrence without iterating over the leading 0x00 noise.
+    // Convention: pattern bytes at WILDCARD positions are 0
+    // (bytearrayMatches ANDs memory with the wildcard mask, which is zero for WILDCARD slots).
+    const pattern = [_]u8{ 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .WILDCARD, .FIXED, .FIXED, .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    // Lots of 0x00 noise so a single-byte anchor would iterate over every zero.
+    // Only one full pattern occurrence (with 0x77 at the wildcard slot),
+    // starting at offset 8. start = hit(10) - anchor_start(2) = 8.
+    const chunk = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x77, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xf000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0xf008, matches.nthMatch(0).?.address);
+    var stored: [6]u8 = undefined;
+    const m = matches.nthMatch(0).?;
+    try std.testing.expectEqualSlices(u8, chunk[8..14], matches.dataToBytes(m.swath_offset, m.index, 6, &stored));
+}
+
+test "scanChunkIntoMatches: bytearray exact no-wildcard finds overlapping matches via multi-byte indexOfPos" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    // All-FIXED pattern -> anchor_len == pattern.len, so the search needle is the full pattern itself.
+    // Overlapping occurrences must still be detected (search_pos = hit + 1, not hit + pattern.len).
+    const pattern = [_]u8{ 0xab, 0xcd, 0xab };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const chunk = [_]u8{ 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xf100, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0xf100, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0xf102, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(0xf104, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: bytearray all-wildcard respects alignment" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const pattern = [_]u8{ 0x00, 0x00 };
+    const wildcards = [_]value_mod.Wildcard{ .WILDCARD, .WILDCARD };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const chunk = [_]u8{ 1, 2, 3, 4, 5, 6, 7 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xc001, &chunk, chunk.len, 2, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(3, matches.matchCount());
+    try std.testing.expectEqual(0xc002, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0xc006, matches.nthMatch(2).?.address);
+}
+
+test "scanChunkIntoMatches: bytearray exact carries chunk-boundary trailing bytes" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const pattern = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const wildcards = [_]value_mod.Wildcard{ .FIXED, .FIXED, .FIXED, .FIXED };
+    const user = UserValue{ .bytearray_value = &pattern, .wildcard_value = &wildcards };
+    const prepared = PreparedScan{
+        .match_type = .MATCHEQUALTO,
+        .data_type = .BYTEARRAY,
+    };
+
+    const first_chunk = [_]u8{ 0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd };
+    const second_chunk = [_]u8{ 0xcc, 0xdd, 0x33 };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xd000, &first_chunk, 4, 1, &required_extra, &num_matches);
+    try std.testing.expectEqual(2, required_extra);
+    try scanChunkIntoMatches(&matches, prepared, null, &.{user}, 0xd004, &second_chunk, second_chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0xd002, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0, required_extra);
+    var stored: [4]u8 = undefined;
+    const location = matches.nthMatch(0).?;
+    try std.testing.expectEqualSlices(u8, &pattern, matches.dataToBytes(location.swath_offset, location.index, 4, &stored));
+}
+
+test "scanChunkIntoMatches: string MATCHANY tail records shrinking lengths per aligned candidate" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    // chunk.len < scan_limit + maxInt(u16) -> tail path.
+    // With chunk.len == 6 each candidate stores "chunk.len - offset" bytes as its variable length.
+    const chunk = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f' };
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .STRING,
+    };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{}, 0xe000, &chunk, chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(6, num_matches);
+    try std.testing.expectEqual(6, matches.matchCount());
+    try std.testing.expectEqual(6, matches.storedByteCount());
+    try std.testing.expectEqual(0xe000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(6, matches.nthMatch(0).?.raw_match_info_bits);
+    try std.testing.expectEqual(0xe005, matches.nthMatch(5).?.address);
+    try std.testing.expectEqual(1, matches.nthMatch(5).?.raw_match_info_bits);
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: bytearray MATCHANY tail honors alignment and records shrinking lengths" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const chunk = [_]u8{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .BYTEARRAY,
+    };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    // base 0xe001 with alignment 4 -> first candidate at offset 3 (abs 0xe004), then 0xe008.
+    // Each gets raw_bits == remaining chunk bytes after it.
+    try scanChunkIntoMatches(&matches, prepared, null, &.{}, 0xe001, &chunk, chunk.len, 4, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(2, num_matches);
+    try std.testing.expectEqual(2, matches.matchCount());
+    try std.testing.expectEqual(0xe004, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(6, matches.nthMatch(0).?.raw_match_info_bits);
+    try std.testing.expectEqual(0xe008, matches.nthMatch(1).?.address);
+    try std.testing.expectEqual(2, matches.nthMatch(1).?.raw_match_info_bits);
+    try std.testing.expectEqual(0, required_extra);
+}
+
+test "scanChunkIntoMatches: string MATCHANY common-chunk bulk records maxInt(u16) per candidate" {
+    var matches = try MatchesArray.init(std.testing.allocator, 1 << 18, 1);
+    defer matches.deinit();
+
+    // chunk.len + 1 >= scan_limit + maxInt(u16) -> common path.
+    // Smallest shape: scan_limit = 1, chunk.len = maxInt(u16).
+    // Single candidate at offset 0 with raw_bits = maxInt(u16), required_extra carries the rest.
+    const chunk_len: usize = std.math.maxInt(u16);
+    const chunk = try std.testing.allocator.alloc(u8, chunk_len);
+    defer std.testing.allocator.free(chunk);
+    for (chunk, 0..) |*b, i| b.* = @truncate(i);
+
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .STRING,
+    };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{}, 0xf0000000, chunk, 1, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(1, num_matches);
+    try std.testing.expectEqual(1, matches.matchCount());
+    try std.testing.expectEqual(0xf0000000, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(std.math.maxInt(u16), matches.nthMatch(0).?.raw_match_info_bits);
+    try std.testing.expectEqual(std.math.maxInt(u16) - 1, required_extra);
+}
+
+test "scanChunkIntoMatches: bytearray MATCHANY tail records consecutive chunks independently" {
+    var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
+    defer matches.deinit();
+
+    const first_chunk = [_]u8{ 0xa0, 0xa1, 0xa2 };
+    const second_chunk = [_]u8{ 0xa3, 0xa4 };
+    const prepared = PreparedScan{
+        .match_type = .MATCHANY,
+        .data_type = .BYTEARRAY,
+    };
+    var required_extra: usize = 0;
+    var num_matches: usize = 0;
+
+    // Tail chunks only know bytes present in the current chunk,
+    // so each candidate records the remaining bytes after its own start.
+    // No carry is needed between these two tail calls.
+    try scanChunkIntoMatches(&matches, prepared, null, &.{}, 0xe100, &first_chunk, first_chunk.len, 1, &required_extra, &num_matches);
+    try std.testing.expectEqual(3, num_matches);
+    try std.testing.expectEqual(0, required_extra); // pending_end clamped to scan_limit == chunk.len
+
+    try scanChunkIntoMatches(&matches, prepared, null, &.{}, 0xe103, &second_chunk, second_chunk.len, 1, &required_extra, &num_matches);
+    try matches.finalize();
+
+    try matches.validate();
+    try std.testing.expectEqual(5, num_matches);
+    try std.testing.expectEqual(5, matches.matchCount());
+    try std.testing.expectEqual(0xe100, matches.nthMatch(0).?.address);
+    try std.testing.expectEqual(0xe104, matches.nthMatch(4).?.address);
+    try std.testing.expectEqual(2, matches.nthMatch(3).?.raw_match_info_bits);
+    try std.testing.expectEqual(1, matches.nthMatch(4).?.raw_match_info_bits);
+}
+
+test "serializeWriteValue: writes native-endian integer32 when not reversing" {
     const user = try UserValue.parseNumber("0x12345678");
     var scratch: [8]u8 = undefined;
     const bytes = try serializeWriteValue(.INTEGER32, false, user, null, &scratch);
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x78, 0x56, 0x34, 0x12 }, bytes);
+    const expected_len: usize = 4;
+    const expected_value: u32 = 0x12345678;
+    try std.testing.expectEqual(expected_len, bytes.len);
+    try std.testing.expectEqual(expected_value, std.mem.readInt(u32, bytes[0..4], .native));
 }
 
-test "serializeWriteValue: encodes reverse-endian float32" {
+test "serializeWriteValue: writes reverse-of-native float32 when reversing" {
     const user = try UserValue.parseFloat("1.5");
     var scratch: [8]u8 = undefined;
     const bytes = try serializeWriteValue(.FLOAT32, true, user, null, &scratch);
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x3f, 0xc0, 0x00, 0x00 }, bytes);
+    // With reverse_endianness=true the bytes are the byte-swapped form of the float's bit pattern.
+    // Reading them back as native must yield byteSwap(bits).
+    const sample: f32 = 1.5;
+    const sample_bits: u32 = @bitCast(sample);
+    const expected_bits = @byteSwap(sample_bits);
+    const expected_len: usize = 4;
+    try std.testing.expectEqual(expected_len, bytes.len);
+    try std.testing.expectEqual(expected_bits, std.mem.readInt(u32, bytes[0..4], .native));
 }
 
 test "serializeWriteValue: rejects ambiguous anynumber writes" {
@@ -1933,8 +6369,8 @@ test "storedMatchBytes: rejects too-small buffer for variable-length matches" {
     defer scanner.deinit();
     scanner.options.scan_data_type = .BYTEARRAY;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
-    try matches.append(0x6000, 0xaa, @bitCast(@as(u16, 3)));
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try matches.appendRaw(0x6000, 0xaa, 3);
     try matches.append(0x6001, 0xbb, .{});
     try matches.append(0x6002, 0xcc, .{});
     try matches.finalize();
@@ -1951,8 +6387,8 @@ test "readMatchBytes: rejects too-small buffer before process read" {
     defer scanner.deinit();
     scanner.options.scan_data_type = .BYTEARRAY;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
-    try matches.append(0x6000, 0xaa, @bitCast(@as(u16, 3)));
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try matches.appendRaw(0x6000, 0xaa, 3);
     try matches.append(0x6001, 0xbb, .{});
     try matches.append(0x6002, 0xcc, .{});
     try matches.finalize();
@@ -1969,8 +6405,8 @@ test "readNumericMatchValue: rejects variable-length matches" {
     defer scanner.deinit();
     scanner.options.scan_data_type = .STRING;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
-    try matches.append(0x7000, 'a', @bitCast(@as(u16, 3)));
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try matches.appendRaw(0x7000, 'a', 3);
     try matches.append(0x7001, 'b', .{});
     try matches.append(0x7002, 'c', .{});
     try matches.finalize();
@@ -1986,8 +6422,8 @@ test "writeMatch: rejects wrong variable-length replacement before process write
     defer scanner.deinit();
     scanner.options.scan_data_type = .STRING;
 
-    var matches = try MatchesArray.init(std.testing.allocator, 256);
-    try matches.append(0x7000, 'a', @bitCast(@as(u16, 3)));
+    var matches = try MatchesArray.init(std.testing.allocator, 256, 1);
+    try matches.appendRaw(0x7000, 'a', 3);
     try matches.append(0x7001, 'b', .{});
     try matches.append(0x7002, 'c', .{});
     try matches.finalize();

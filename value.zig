@@ -19,7 +19,7 @@
 
 const std = @import("std");
 
-pub const Allocator = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
 
 const whitespace = " \t\n\r\x0b\x0c";
 
@@ -29,10 +29,6 @@ pub const ParseError = error{
     InvalidFloat,
     InvalidNumber,
     OutOfMemory,
-};
-
-pub const ConversionError = error{
-    InvalidMatchFlags,
 };
 
 /// Flags that represent the potential type of a match
@@ -80,10 +76,6 @@ pub const MatchFlags = packed struct(u16) {
     pub fn bits(self: MatchFlags) u16 {
         return @bitCast(self);
     }
-
-    pub fn hasAny(self: MatchFlags) bool {
-        return self.bits() != 0;
-    }
 };
 
 pub const ValueData = extern union {
@@ -105,62 +97,6 @@ pub const ValueData = extern union {
 pub const Value = extern struct {
     data: ValueData = .{ .uint64_value = 0 },
     flags: MatchFlags = .{},
-
-    pub fn initFromUserValue(src: UserValue, target_flags: MatchFlags) ConversionError!Value {
-        var value = Value{
-            .data = .{ .uint64_value = 0 },
-            .flags = target_flags,
-        };
-        try value.setFromUserValue(src);
-        return value;
-    }
-
-    pub fn setFromUserValue(self: *Value, src: UserValue) ConversionError!void {
-        self.data.uint64_value = 0;
-
-        if (self.flags.f64b) {
-            self.data.float64_value = src.float64_value;
-            return;
-        }
-        if (self.flags.u64b) {
-            self.data.uint64_value = src.uint64_value;
-            return;
-        }
-        if (self.flags.s64b) {
-            self.data.int64_value = src.int64_value;
-            return;
-        }
-        if (self.flags.f32b) {
-            self.data.float32_value = src.float32_value;
-            return;
-        }
-        if (self.flags.u32b) {
-            self.data.uint32_value = src.uint32_value;
-            return;
-        }
-        if (self.flags.s32b) {
-            self.data.int32_value = src.int32_value;
-            return;
-        }
-        if (self.flags.u16b) {
-            self.data.uint16_value = src.uint16_value;
-            return;
-        }
-        if (self.flags.s16b) {
-            self.data.int16_value = src.int16_value;
-            return;
-        }
-        if (self.flags.u8b) {
-            self.data.uint8_value = src.uint8_value;
-            return;
-        }
-        if (self.flags.s8b) {
-            self.data.int8_value = src.int8_value;
-            return;
-        }
-
-        return ConversionError.InvalidMatchFlags;
-    }
 };
 
 pub const Wildcard = enum(u8) {
@@ -192,7 +128,6 @@ pub const UserValue = struct {
         self.wildcard_value = null;
     }
 
-    // TODO: Recheck if we need UserValue's parse functions after PINCE's GDB -> memscan memory write transition is done
     pub fn parseByteArray(allocator: Allocator, tokens: []const []const u8) ParseError!UserValue {
         var result = UserValue{};
         errdefer result.deinit(allocator);
@@ -425,11 +360,4 @@ test "parseByteArrayText: tokenizes whitespace-delimited input" {
 
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x4F, 0x00, 0xA0 }, value.bytearray_value.?);
     try std.testing.expectEqualSlices(Wildcard, &[_]Wildcard{ .FIXED, .WILDCARD, .FIXED }, value.wildcard_value.?);
-}
-
-test "Value: initialization from user value prefers floats over ints for matching widths" {
-    const user = try UserValue.parseNumber("3.5");
-    const value = try Value.initFromUserValue(user, .{ .f32b = true, .u32b = true, .s32b = true });
-    try std.testing.expectEqual((MatchFlags{ .f32b = true, .u32b = true, .s32b = true }).bits(), value.flags.bits());
-    try std.testing.expectEqual(3.5, value.data.float32_value);
 }

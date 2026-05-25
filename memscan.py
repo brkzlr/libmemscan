@@ -75,6 +75,7 @@ class Status(IntEnum):
     POINTER_MAP_CREATE_FAILED = 32
     POINTER_MAP_READ_FAILED = 33
     POINTER_MAP_WRITE_FAILED = 34
+    OPTION_REQUIRES_RESET = 35
 
 
 class ScanLevel(IntEnum):
@@ -889,18 +890,18 @@ class Libmemscan:
         return MatchFlagsView(raw_match_info_bits)
 
     def _match_length(self, record: MatchRecord) -> int:
-        # TODO: This currently derives numeric byte width from the wrapper's active
-        # DataType, not the stored match's original type. This can be an issue if you
-        # don't reset() after changing.
         if self._data_type in (DataType.BYTEARRAY, DataType.STRING):
-            return int(record.raw_match_info_bits)
-        if self._data_type in (DataType.INTEGER8,):
-            return 1
-        if self._data_type in (DataType.INTEGER16,):
-            return 2
-        if self._data_type in (DataType.INTEGER32, DataType.FLOAT32):
+            return int(record.raw_match_info_bits)  # aob/string length
+        flags = int(record.raw_match_info_bits)
+        if flags & (FLAG_U64 | FLAG_S64 | FLAG_F64):
+            return 8
+        if flags & (FLAG_U32 | FLAG_S32 | FLAG_F32):
             return 4
-        return 8
+        if flags & (FLAG_U16 | FLAG_S16):
+            return 2
+        if flags & (FLAG_U8 | FLAG_S8):
+            return 1
+        return 0
 
     def get_stored_match_bytes(self, match_index: int) -> bytes:
         record = self.get_match(match_index)

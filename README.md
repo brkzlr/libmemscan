@@ -4,6 +4,5 @@ A Zig rewrite of a [PINCE](https://github.com/korcankaraokcu/PINCE) specialized 
 Made for PINCE in mind but usable for other purposes as well.
 
 ## TODOs
-- Compact allocations further.
 - Actually write a proper README.
 - More stuff as I remember...

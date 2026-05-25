@@ -93,6 +93,7 @@ pub const LmStatus = enum(c_int) {
     POINTER_MAP_CREATE_FAILED = 32,
     POINTER_MAP_READ_FAILED = 33,
     POINTER_MAP_WRITE_FAILED = 34,
+    OPTION_REQUIRES_RESET = 35,
 };
 
 pub const LmDataType = enum(c_int) {
@@ -188,10 +189,6 @@ fn toHandle(raw: ?*LmScanner) ?*AbiScanner {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn fromHandle(handle: *AbiScanner) *LmScanner {
-    return @ptrCast(handle);
-}
-
 fn absolutePathFromAbi(raw: ?[*:0]const u8) ?[]const u8 {
     const ptr = raw orelse return null;
     const path = std.mem.span(ptr);
@@ -210,6 +207,7 @@ fn statusFrom(err: anyerror) LmStatus {
         error.UndoIoFailed => .UNDO_IO_FAILED,
         error.UndoCorrupt => .UNDO_CORRUPT,
         error.SnapshotRequiresReset => .SNAPSHOT_REQUIRES_RESET,
+        error.OptionRequiresReset => .OPTION_REQUIRES_RESET,
         error.MatchIndexOutOfRange => .MATCH_INDEX_OUT_OF_RANGE,
         error.BufferTooSmall => .BUFFER_TOO_SMALL,
         error.InvalidUserValueCount => .INVALID_USER_VALUE_COUNT,
@@ -247,19 +245,6 @@ fn statusFrom(err: anyerror) LmStatus {
     };
 }
 
-fn wildcardSlice(raw: [*]const u8, len: usize) ![]const Wildcard {
-    const raw_slice = raw[0..len];
-    for (raw_slice) |item| {
-        switch (item) {
-            @intFromEnum(Wildcard.FIXED), @intFromEnum(Wildcard.WILDCARD) => {},
-            else => return error.InvalidArgument,
-        }
-    }
-
-    const typed_ptr: [*]const Wildcard = @ptrCast(raw);
-    return typed_ptr[0..len];
-}
-
 fn userValueFromAbi(raw: LmUserValue, data_type: ScanDataType, for_write: bool) !UserValue {
     var user = UserValue{
         .int8_value = raw.int8_value,
@@ -281,7 +266,15 @@ fn userValueFromAbi(raw: LmUserValue, data_type: ScanDataType, for_write: bool) 
             user.bytearray_value = data_ptr[0..raw.data_len];
             if (!for_write) {
                 const wildcards_ptr = raw.wildcards orelse return error.InvalidArgument;
-                user.wildcard_value = try wildcardSlice(wildcards_ptr, raw.data_len);
+                const raw_wildcards = wildcards_ptr[0..raw.data_len];
+                for (raw_wildcards) |item| {
+                    switch (item) {
+                        @intFromEnum(Wildcard.FIXED), @intFromEnum(Wildcard.WILDCARD) => {},
+                        else => return error.InvalidArgument,
+                    }
+                }
+                const typed_wildcards: [*]const Wildcard = @ptrCast(wildcards_ptr);
+                user.wildcard_value = typed_wildcards[0..raw.data_len];
             }
         },
         .STRING => {
@@ -331,6 +324,7 @@ pub export fn lm_status_name(status_code: c_int) [*:0]const u8 {
         @intFromEnum(LmStatus.POINTER_MAP_CREATE_FAILED) => "POINTER_MAP_CREATE_FAILED",
         @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED) => "POINTER_MAP_READ_FAILED",
         @intFromEnum(LmStatus.POINTER_MAP_WRITE_FAILED) => "POINTER_MAP_WRITE_FAILED",
+        @intFromEnum(LmStatus.OPTION_REQUIRES_RESET) => "OPTION_REQUIRES_RESET",
         else => "INVALID_STATUS",
     };
 }
@@ -340,7 +334,7 @@ pub export fn lm_scanner_create() ?*LmScanner {
     handle.* = .{
         .scanner = Scanner.init(c_allocator, std.Io.Threaded.global_single_threaded.io()),
     };
-    return fromHandle(handle);
+    return @ptrCast(handle);
 }
 
 pub export fn lm_scanner_destroy(raw: ?*LmScanner) void {
@@ -351,7 +345,8 @@ pub export fn lm_scanner_destroy(raw: ?*LmScanner) void {
 
 pub export fn lm_attach(raw: ?*LmScanner, pid: c_uint) c_int {
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
-    handle.scanner.attach(@intCast(pid)) catch |err| return @intFromEnum(statusFrom(err));
+    const pid_value = std.math.cast(std.posix.pid_t, pid) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    handle.scanner.attach(pid_value) catch |err| return @intFromEnum(statusFrom(err));
     return @intFromEnum(LmStatus.OK);
 }
 
@@ -396,19 +391,19 @@ pub export fn lm_set_data_type(raw: ?*LmScanner, data_type: c_int) c_int {
         @intFromEnum(LmDataType.STRING) => .STRING,
         else => return @intFromEnum(LmStatus.INVALID_ARGUMENT),
     };
-    handle.scanner.setDataType(type_enum);
+    handle.scanner.setDataType(type_enum) catch |err| return @intFromEnum(statusFrom(err));
     return @intFromEnum(LmStatus.OK);
 }
 
 pub export fn lm_set_reverse_endianness(raw: ?*LmScanner, enabled: bool) c_int {
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
-    handle.scanner.setReverseEndianness(enabled);
+    handle.scanner.setReverseEndianness(enabled) catch |err| return @intFromEnum(statusFrom(err));
     return @intFromEnum(LmStatus.OK);
 }
 
 pub export fn lm_set_alignment(raw: ?*LmScanner, alignment: u16) c_int {
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
-    handle.scanner.options.alignment = alignment;
+    handle.scanner.setAlignment(alignment) catch |err| return @intFromEnum(statusFrom(err));
     return @intFromEnum(LmStatus.OK);
 }
 
