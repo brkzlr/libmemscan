@@ -2758,19 +2758,10 @@ fn decodeValueForTargetEndian(data_type: ScanDataType, reverse_endianness: bool,
         .FLOAT32 => if (value.flags.f32b) 4 else return value,
         .FLOAT64 => if (value.flags.f64b) 8 else return value,
         .ANYINTEGER, .ANYFLOAT, .ANYNUMBER => blk: {
-            const bits = value.flags.bits();
-            if (bits == 0) return value;
-
-            const width1 = MatchFlags.i8b.bits();
-            const width2 = MatchFlags.i16b.bits();
-            const width4 = MatchFlags.i32b.bits() | (MatchFlags{ .f32b = true }).bits();
-            const width8 = MatchFlags.i64b.bits() | (MatchFlags{ .f64b = true }).bits();
-
-            if ((bits & ~width1) == 0) break :blk 1;
-            if ((bits & ~width2) == 0) break :blk 2;
-            if ((bits & ~width4) == 0) break :blk 4;
-            if ((bits & ~width8) == 0) break :blk 8;
-            return value;
+            // These types carry cumulative flags (every width the value fits), so the stored bytes are the widest interpretation.
+            const w = flagsToNumericLength(value.flags);
+            if (w == 0) return value;
+            break :blk w;
         },
         .BYTEARRAY, .STRING => return value,
     };
@@ -4717,6 +4708,32 @@ test "rescanMatches: anyfloat reverse-endian increased decodes old bytes symmetr
     try scanner.matches.?.validate();
     try std.testing.expectEqual(1, scanner.matchCount());
     try std.testing.expectEqual((MatchFlags{ .f32b = true }).bits(), (try scanner.matchAt(0)).raw_match_info_bits);
+}
+
+test "matchAt: anyinteger reverse-endian decodes multi-width match by widest stored width" {
+    const allocator = std.testing.allocator;
+
+    // ANY types stores cumulative flags (every width the value fits),
+    // so the stored bytes are the widest interpretation and must be byteswapped by that full width.
+    const host_value: u64 = 0x0102030405060708;
+    var stored_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &stored_bytes, @byteSwap(host_value), .native);
+
+    var scanner = Scanner.init(allocator, std.testing.io);
+    defer scanner.deinit();
+    scanner.options.scan_data_type = .ANYINTEGER;
+    scanner.options.reverse_endianness = true;
+
+    const base_address = @intFromPtr(&stored_bytes);
+    var matches = try MatchesArray.init(allocator, 256, 1);
+    try matches.appendRun(base_address, &stored_bytes, MatchFlags.integer.bits(), 1);
+    try matches.finalize();
+    scanner.matches = matches;
+    scanner.num_matches = matches.matchCount();
+
+    const record = try scanner.matchAt(0);
+    try std.testing.expectEqual(MatchFlags.integer.bits(), record.raw_match_info_bits);
+    try std.testing.expectEqual(host_value, record.stored_value.data.uint64_value);
 }
 
 test "rescanMatches: anyfloat delta full segment gates unchanged f32 window" {
