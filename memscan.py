@@ -886,9 +886,6 @@ class Libmemscan:
         self._check(self._lib.lm_get_match(self._scanner, match_index, ctypes.byref(record)), "get_match")
         return record
 
-    def _make_match_info(self, raw_match_info_bits: int) -> MatchFlagsView:
-        return MatchFlagsView(raw_match_info_bits)
-
     def _match_length(self, record: MatchRecord) -> int:
         if self._data_type in (DataType.BYTEARRAY, DataType.STRING):
             return int(record.raw_match_info_bits)  # aob/string length
@@ -903,8 +900,7 @@ class Libmemscan:
             return 1
         return 0
 
-    def get_stored_match_bytes(self, match_index: int) -> bytes:
-        record = self.get_match(match_index)
+    def _stored_match_bytes(self, match_index: int, record: MatchRecord) -> bytes:
         buf_len = self._match_length(record)
         buf = (ctypes.c_uint8 * max(buf_len, 1))()
         out_len = ctypes.c_size_t()
@@ -914,13 +910,16 @@ class Libmemscan:
         )
         return bytes(buf[: out_len.value])
 
-    def get_stored_match_value(self, match_index: int) -> object:
-        record = self.get_match(match_index)
+    def get_stored_match_bytes(self, match_index: int) -> bytes:
+        return self._stored_match_bytes(match_index, self.get_match(match_index))
 
+    def _stored_match_value(self, match_index: int, record: MatchRecord) -> object:
         if self._data_type in (DataType.BYTEARRAY, DataType.STRING):
-            return self.get_stored_match_bytes(match_index)
-
+            return self._stored_match_bytes(match_index, record)
         return record.stored_value
+
+    def get_stored_match_value(self, match_index: int) -> object:
+        return self._stored_match_value(match_index, self.get_match(match_index))
 
     def read_bytes_exact(self, address: int, length: int) -> bytes:
         buf = (ctypes.c_uint8 * length)()
@@ -972,6 +971,6 @@ class Libmemscan:
                 index=record.index,
                 address=record.address,
                 data_type=self._data_type,
-                match_info=self._make_match_info(record.raw_match_info_bits),
-                stored_value=self.get_stored_match_value(index),
+                match_info=MatchFlagsView(record.raw_match_info_bits),
+                stored_value=self._stored_match_value(index, record),
             )
