@@ -310,8 +310,8 @@ pub const Scanner = struct {
         var kept_regions: []Region = &.{};
         if (kept_len != 0) {
             kept_regions = self.allocator.alloc(Region, kept_len) catch return ScannerError.OutOfMemory;
-            errdefer self.allocator.free(kept_regions);
         }
+        errdefer self.allocator.free(kept_regions);
 
         if (self.matches) |*matches| {
             for (self.regions) |region| {
