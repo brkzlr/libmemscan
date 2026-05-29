@@ -594,7 +594,7 @@ class Libmemscan:
             if -(1 << 31) <= value <= (1 << 31) - 1:
                 raw.int32_value = truncated
                 flags |= FLAG_S32
-            if 0 <= value <= float((1 << 64) - 1):
+            if 0 <= value <= (1 << 64) - 1:
                 raw.uint64_value = truncated
                 flags |= FLAG_U64
             if -(1 << 63) <= value <= (1 << 63) - 1:
