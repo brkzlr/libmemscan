@@ -136,6 +136,7 @@ pub const Scanner = struct {
     undo_available: bool = false,
     num_matches: usize = 0,
     scan_progress: f64 = 0,
+    resolve_progress: f64 = 0,
     stop_flag: bool = false,
     fresh_session: bool = true,
     options: ScanOptions = .{},
@@ -446,6 +447,7 @@ pub const Scanner = struct {
         defer valid_pointer_values.deinit();
 
         self.scan_progress = 0;
+        self.resolve_progress = 0;
         @atomicStore(bool, &self.stop_flag, false, .monotonic);
         if (valid_pointer_values.len() != 0) {
             const buffer = self.allocator.alloc(u8, max_read_size) catch return ScannerError.OutOfMemory;
@@ -494,9 +496,11 @@ pub const Scanner = struct {
         var finder = try pointerscan.PointerPathFinder.init(self.allocator, &index, modules, options);
         defer finder.deinit();
         finder.stop_flag = &self.stop_flag;
+        finder.progress = &self.resolve_progress;
 
         try finder.findPathsToValue(target_address, &map_writer);
         try map_writer.finish();
+        self.resolve_progress = 1.0;
 
         return finder.results_found;
     }

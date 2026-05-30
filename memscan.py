@@ -475,6 +475,9 @@ class Libmemscan:
         self._lib.lm_scan_progress.restype = ctypes.c_double
         self._lib.lm_scan_progress.argtypes = [ctypes.c_void_p]
 
+        self._lib.lm_pointer_resolve_progress.restype = ctypes.c_double
+        self._lib.lm_pointer_resolve_progress.argtypes = [ctypes.c_void_p]
+
     def _status_name(self, status: int) -> str:
         return decode(self._lib.lm_status_name(status))
 
@@ -801,6 +804,9 @@ class Libmemscan:
 
     def get_scan_progress(self) -> float:
         return float(self._lib.lm_scan_progress(self._scanner))
+
+    def get_pointer_resolve_progress(self) -> float:
+        return float(self._lib.lm_pointer_resolve_progress(self._scanner))
 
     def remove_region_by_id(self, region_id: int) -> bool:
         removed = ctypes.c_bool()

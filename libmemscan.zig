@@ -428,6 +428,11 @@ pub export fn lm_scan_progress(raw: ?*LmScanner) f64 {
     return handle.scanner.scan_progress;
 }
 
+pub export fn lm_pointer_resolve_progress(raw: ?*LmScanner) f64 {
+    const handle = toHandle(raw) orelse return 0;
+    return handle.scanner.resolve_progress;
+}
+
 pub export fn lm_snapshot(raw: ?*LmScanner) c_int {
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
     handle.scanner.snapshot() catch |err| return @intFromEnum(statusFrom(err));

@@ -649,6 +649,7 @@ pub const PointerPathFinder = struct {
     modules: []const ModuleBase,
     options: PointerScanOptions,
     stop_flag: ?*const bool = null,
+    progress: ?*f64 = null,
     offset_stack: std.ArrayList(i64) = .empty,
     address_stack: std.ArrayList(usize) = .empty,
     path_offsets: []i64 = &.{},
@@ -696,9 +697,30 @@ pub const PointerPathFinder = struct {
             }
         }
 
+        const progress: ?*f64 = if (self.address_stack.items.len == 0) self.progress else null;
+        const range_start = entry_index;
+        var range_span: f64 = 0;
+        if (progress != null) {
+            var lo = entry_index;
+            var hi = self.reverse_index.entries.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.reverse_index.entries[mid].value > highest_candidate_value) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            range_span = @floatFromInt(lo - range_start);
+        }
+
         while (entry_index < self.reverse_index.entries.len) : (entry_index += 1) {
             if (self.stop_flag) |flag| {
                 if (@atomicLoad(bool, flag, .monotonic)) return;
+            }
+
+            if (progress) |p| {
+                if (range_span > 0) p.* = @as(f64, @floatFromInt(entry_index - range_start)) / range_span;
             }
 
             const candidate = self.reverse_index.entries[entry_index];
@@ -763,6 +785,8 @@ pub const PointerPathFinder = struct {
                 if (self.reachedResultLimit()) return;
             }
         }
+
+        if (progress) |p| p.* = 1.0;
     }
 
     fn reachedResultLimit(self: *const PointerPathFinder) bool {
@@ -1001,6 +1025,39 @@ test "PointerPathFinder: finds static paths from synthetic entries" {
     }
 
     try expectMapText(io, tmp.dir, "scan.lmptr", "game.exe+0x0 -> 0x0 -> 0x20\n");
+}
+
+test "PointerPathFinder: reports path-finding progress" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const entries = [_]PointerEntry{
+        .{ .address = 0x3000, .value = 0x4000 },
+        .{ .address = 0x3100, .value = 0x4400 },
+        .{ .address = 0x3200, .value = 0x4800 },
+        .{ .address = 0x3300, .value = 0x4C00 },
+    };
+
+    var index = try PointerReverseIndex.fromEntries(std.testing.allocator, &entries);
+    defer index.deinit();
+
+    const file = try tmp.dir.createFile(io, "progress.lmptr", .{ .read = true, .truncate = true });
+    var writer = try PointerMapWriter.init(io, file, 8, &.{});
+    defer writer.deinit();
+
+    var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
+        .max_depth = 1,
+        .max_positive_offset = 0x1000,
+    });
+    defer finder.deinit();
+
+    var progress: f64 = 0;
+    finder.progress = &progress;
+
+    try finder.findPathsToValue(0x5000, &writer);
+    try std.testing.expectEqual(1.0, progress);
+    try writer.finish();
 }
 
 test "PointerPathFinder: emits absolute bases when module bases are optional" {
