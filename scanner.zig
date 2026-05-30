@@ -161,7 +161,7 @@ pub const Scanner = struct {
 
         self.target_pid = null;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
     }
 
     pub fn attach(self: *Scanner, pid: std.posix.pid_t) ScannerError!void {
@@ -187,7 +187,7 @@ pub const Scanner = struct {
         self.process_handle = null;
         self.target_pid = null;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
         self.fresh_session = true;
     }
 
@@ -225,14 +225,14 @@ pub const Scanner = struct {
     }
 
     pub fn setStopFlag(self: *Scanner, stop: bool) void {
-        self.stop_flag = stop;
+        @atomicStore(bool, &self.stop_flag, stop, .monotonic);
     }
 
     pub fn reset(self: *Scanner) ScannerError!void {
         self.resetMatches();
         self.clearUndoHistory();
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
         self.fresh_session = true;
 
         if (self.process_handle != null) {
@@ -394,7 +394,7 @@ pub const Scanner = struct {
                     _ = try self.prepareScan(match_type, user_values);
                     self.resetMatches();
                     self.scan_progress = 1.0;
-                    self.stop_flag = false;
+                    @atomicStore(bool, &self.stop_flag, false, .monotonic);
                     self.fresh_session = false;
                     return;
                 },
@@ -446,7 +446,7 @@ pub const Scanner = struct {
         defer valid_pointer_values.deinit();
 
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
         if (valid_pointer_values.len() != 0) {
             const buffer = self.allocator.alloc(u8, max_read_size) catch return ScannerError.OutOfMemory;
             defer self.allocator.free(buffer);
@@ -459,7 +459,7 @@ pub const Scanner = struct {
 
                 var region_offset: usize = 0;
                 while (region_offset < region.size) {
-                    if (self.stop_flag) break;
+                    if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
                     const region_remaining = region.size - region_offset;
                     const read_size = @min(region_remaining, max_read_size);
@@ -476,7 +476,7 @@ pub const Scanner = struct {
                     updateProgress(self, processed_bytes, total_bytes);
                 }
 
-                if (self.stop_flag) break;
+                if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
             }
         }
         self.scan_progress = 1.0;
@@ -491,17 +491,14 @@ pub const Scanner = struct {
         var map_writer = try pointerscan.PointerMapWriter.init(self.io, output_map_file, options.pointer_width, modules);
         defer map_writer.deinit();
 
-        const paths_found = try pointerscan.findPointerPaths(
-            self.allocator,
-            &index,
-            modules,
-            options,
-            target_address,
-            &map_writer,
-        );
+        var finder = try pointerscan.PointerPathFinder.init(self.allocator, &index, modules, options);
+        defer finder.deinit();
+        finder.stop_flag = &self.stop_flag;
+
+        try finder.findPathsToValue(target_address, &map_writer);
         try map_writer.finish();
 
-        return paths_found;
+        return finder.results_found;
     }
 
     pub fn readBytes(self: *Scanner, address: usize, buf: []u8) ScannerError!usize {
@@ -650,7 +647,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         const total_bytes = totalRegionBytes(self.regions);
         var processed_bytes: usize = 0;
@@ -660,7 +657,7 @@ pub const Scanner = struct {
             var region_offset: usize = 0;
 
             while (region_offset < region.size) {
-                if (self.stop_flag) break;
+                if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
                 const remaining = region.size - region_offset;
                 const read_size = @min(remaining, chunk_payload_size + overlap);
@@ -690,7 +687,7 @@ pub const Scanner = struct {
             }
 
             required_extra_bytes = 0;
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
         }
 
         try matches.finalize();
@@ -751,7 +748,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -766,7 +763,7 @@ pub const Scanner = struct {
         };
 
         while (iterator.next()) |location| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const stored_len = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
             if (stored_len != 0) {
@@ -807,7 +804,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -822,7 +819,7 @@ pub const Scanner = struct {
         };
 
         while (iterator.next()) |location| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const stored_len = storedLengthForExistingMatch(data_type, location.raw_match_info_bits);
             if (stored_len != 0) {
@@ -862,7 +859,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -880,7 +877,7 @@ pub const Scanner = struct {
             };
 
             while (iterator.next()) |location| {
-                if (self.stop_flag) break;
+                if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
                 const old_len = storedLengthForExistingMatch(.STRING, location.raw_match_info_bits);
                 if (old_len >= needle.len) {
@@ -921,7 +918,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -939,7 +936,7 @@ pub const Scanner = struct {
             };
 
             while (iterator.next()) |location| {
-                if (self.stop_flag) break;
+                if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
                 const old_len = storedLengthForExistingMatch(.BYTEARRAY, location.raw_match_info_bits);
                 if (old_len >= pattern.len) {
@@ -978,7 +975,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -1010,7 +1007,7 @@ pub const Scanner = struct {
             null;
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
             if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 if (exact_needles) |needles| {
                     try self.rescanExactFullSegment(old_matches, segment, segment_width, needles, kernel, user_values, &read_cache, &writer, &processed, total_matches);
@@ -1041,7 +1038,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -1056,7 +1053,7 @@ pub const Scanner = struct {
         var processed: usize = 0;
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
             if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 try self.rescanChangedFullSegment(old_matches, segment, segment_width, raw_bits, &read_cache, &writer, &processed, total_matches);
@@ -1084,7 +1081,7 @@ pub const Scanner = struct {
 
         self.num_matches = 0;
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var new_matches = try MatchesArray.init(self.allocator, old_matches.max_needed_bytes, old_matches.stride);
         errdefer new_matches.deinit();
@@ -1104,7 +1101,7 @@ pub const Scanner = struct {
         const kernel = scanroutines.pickFixedDeltaKernel(self.options.scan_data_type, match_type, self.options.reverse_endianness);
         var segments = old_matches.segmentIterator();
         while (segments.next()) |segment| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
             if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 try self.rescanDeltaFullSegment(old_matches, segment, segment_width, raw_bits, kernel, match_type, user_values, &read_cache, &writer, raw_bits_scratch, &processed, total_matches);
@@ -1130,13 +1127,13 @@ pub const Scanner = struct {
         const total_matches = matches.matchCount();
 
         self.scan_progress = 0;
-        self.stop_flag = false;
+        @atomicStore(bool, &self.stop_flag, false, .monotonic);
 
         var cache = MemoryCache{};
         var processed: usize = 0;
         var segments = matches.segmentIterator();
         while (segments.next()) |segment| {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
             if (fullSharedSegmentWidth(segment, self.options.scan_data_type, width)) |segment_width| {
                 const raw_bits = segment.header.shared_raw_bits;
                 self.rescanNotChangedFullSegment(matches, segment, segment_width, raw_bits, &cache, &processed, total_matches);
@@ -1166,7 +1163,7 @@ pub const Scanner = struct {
         const stride: usize = old_matches.stride;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
             const window_len = stridedWindowLen(batch_len, stride, width);
@@ -1237,7 +1234,7 @@ pub const Scanner = struct {
         const handle = &self.process_handle.?;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const batch_len = @min(segment.candidate_count - candidate, MemoryCache.read_chunk_size - width + 1);
             const window_len = batch_len + width - 1;
@@ -1335,7 +1332,7 @@ pub const Scanner = struct {
         const data_type = self.options.scan_data_type;
         var iterator = old_matches.iteratorFrom(segment.swath_offset);
         while (iterator.next()) |location| {
-            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic) or location.swath_offset != segment.swath_offset) break;
             if (location.index < start_index) continue;
 
             // For fixed-width data types stored_len == width always.
@@ -1380,7 +1377,7 @@ pub const Scanner = struct {
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
             const window_len = stridedWindowLen(batch_len, stride, width);
@@ -1450,7 +1447,7 @@ pub const Scanner = struct {
         var old_bytes: [8]u8 = undefined;
         var iterator = old_matches.iteratorFrom(segment.swath_offset);
         while (iterator.next()) |location| {
-            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic) or location.swath_offset != segment.swath_offset) break;
             if (location.index < start_index) continue;
 
             // For fixed-width types stored_len == width.
@@ -1527,7 +1524,7 @@ pub const Scanner = struct {
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
             const window_len = stridedWindowLen(batch_len, stride, width);
@@ -1733,7 +1730,7 @@ pub const Scanner = struct {
         var old_bytes: [8]u8 = undefined;
         var iterator = old_matches.iteratorFrom(segment.swath_offset);
         while (iterator.next()) |location| {
-            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic) or location.swath_offset != segment.swath_offset) break;
             if (location.index < start_index) continue;
 
             // For fixed-width types stored_len == width.
@@ -1778,7 +1775,7 @@ pub const Scanner = struct {
         var old_buf: [MemoryCache.read_chunk_size]u8 = undefined;
         var candidate: usize = 0;
         while (candidate < segment.candidate_count) {
-            if (self.stop_flag) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic)) break;
 
             const batch_len = @min(segment.candidate_count - candidate, stridedBatchLimit(width, stride));
             const window_len = stridedWindowLen(batch_len, stride, width);
@@ -1855,7 +1852,7 @@ pub const Scanner = struct {
         var old_bytes: [8]u8 = undefined;
         var iterator = matches.iteratorFrom(segment.swath_offset);
         while (iterator.next()) |location| {
-            if (self.stop_flag or location.swath_offset != segment.swath_offset) break;
+            if (@atomicLoad(bool, &self.stop_flag, .monotonic) or location.swath_offset != segment.swath_offset) break;
             if (location.index < start_index) continue;
 
             // For fixed-width types stored_len == width.
@@ -2951,7 +2948,7 @@ test "Init: starts detached with defaults" {
     try std.testing.expect(!scanner.hasMatches());
     try std.testing.expect(!scanner.undo_available);
     try std.testing.expect(scanner.fresh_session);
-    try std.testing.expect(!scanner.stop_flag);
+    try std.testing.expect(!@atomicLoad(bool, &scanner.stop_flag, .monotonic));
     try std.testing.expectEqual(0, scanner.scan_progress);
     try std.testing.expectEqual(0, scanner.options.alignment);
     try std.testing.expectEqual(ScanDataType.ANYINTEGER, scanner.options.scan_data_type);
@@ -3120,7 +3117,7 @@ test "setters update scanner options" {
     try std.testing.expectEqual(ScanDataType.FLOAT64, scanner.options.scan_data_type);
     try std.testing.expectEqual(ScanLevel.ALL_RW, scanner.options.scan_level);
     try std.testing.expect(scanner.options.reverse_endianness);
-    try std.testing.expect(scanner.stop_flag);
+    try std.testing.expect(@atomicLoad(bool, &scanner.stop_flag, .monotonic));
 }
 
 test "setDataType: requires a fresh session" {
@@ -3329,7 +3326,7 @@ test "snapshot: requires a fresh reset state" {
     try std.testing.expect(!scanner.hasMatches());
     try std.testing.expectEqual(0, scanner.matchCount());
     try std.testing.expectEqual(0, scanner.scan_progress);
-    try std.testing.expect(!scanner.stop_flag);
+    try std.testing.expect(!@atomicLoad(bool, &scanner.stop_flag, .monotonic));
 }
 
 test "rescanMatches: shrinks integer matches and stores current values" {

@@ -643,32 +643,18 @@ pub const PointerMapReader = struct {
     }
 };
 
-pub fn findPointerPaths(
+pub const PointerPathFinder = struct {
     allocator: Allocator,
     reverse_index: *const PointerReverseIndex,
     modules: []const ModuleBase,
     options: PointerScanOptions,
-    target_address: usize,
-    map_writer: *PointerMapWriter,
-) PointerScanError!u64 {
-    var finder = try PointerPathFinder.init(allocator, reverse_index, modules, options);
-    defer finder.deinit();
-
-    try finder.findPathsToValue(target_address, map_writer);
-    return finder.results_found;
-}
-
-const PointerPathFinder = struct {
-    allocator: Allocator,
-    reverse_index: *const PointerReverseIndex,
-    modules: []const ModuleBase,
-    options: PointerScanOptions,
+    stop_flag: ?*const bool = null,
     offset_stack: std.ArrayList(i64) = .empty,
     address_stack: std.ArrayList(usize) = .empty,
     path_offsets: []i64 = &.{},
     results_found: u64 = 0,
 
-    fn init(allocator: Allocator, reverse_index: *const PointerReverseIndex, modules: []const ModuleBase, options: PointerScanOptions) PointerScanError!PointerPathFinder {
+    pub fn init(allocator: Allocator, reverse_index: *const PointerReverseIndex, modules: []const ModuleBase, options: PointerScanOptions) PointerScanError!PointerPathFinder {
         try options.validate();
 
         var finder = PointerPathFinder{
@@ -686,13 +672,13 @@ const PointerPathFinder = struct {
         return finder;
     }
 
-    fn deinit(self: *PointerPathFinder) void {
+    pub fn deinit(self: *PointerPathFinder) void {
         self.offset_stack.deinit(self.allocator);
         self.address_stack.deinit(self.allocator);
         self.allocator.free(self.path_offsets);
     }
 
-    fn findPathsToValue(self: *PointerPathFinder, target_address: usize, map_writer: *PointerMapWriter) PointerScanError!void {
+    pub fn findPathsToValue(self: *PointerPathFinder, target_address: usize, map_writer: *PointerMapWriter) PointerScanError!void {
         if (self.reachedResultLimit()) return;
 
         const lowest_candidate_value = target_address -| self.options.max_positive_offset;
@@ -711,6 +697,10 @@ const PointerPathFinder = struct {
         }
 
         while (entry_index < self.reverse_index.entries.len) : (entry_index += 1) {
+            if (self.stop_flag) |flag| {
+                if (@atomicLoad(bool, flag, .monotonic)) return;
+            }
+
             const candidate = self.reverse_index.entries[entry_index];
             if (candidate.value > highest_candidate_value) break;
 
@@ -978,7 +968,7 @@ test "PointerReverseIndex: sorts entries by pointed value then address" {
     try std.testing.expectEqualSlices(PointerEntry, &expected, index.entries);
 }
 
-test "findPointerPaths: finds static paths from synthetic entries" {
+test "PointerPathFinder: finds static paths from synthetic entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -999,18 +989,21 @@ test "findPointerPaths: finds static paths from synthetic entries" {
         var writer = try PointerMapWriter.init(io, file, 8, &modules);
         defer writer.deinit();
 
-        const found = try findPointerPaths(std.testing.allocator, &index, &modules, .{
+        var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
             .max_depth = 3,
             .max_positive_offset = 0x100,
-        }, 0x5020, &writer);
-        try std.testing.expectEqual(1, found);
+        });
+        defer finder.deinit();
+
+        try finder.findPathsToValue(0x5020, &writer);
+        try std.testing.expectEqual(1, finder.results_found);
         try writer.finish();
     }
 
     try expectMapText(io, tmp.dir, "scan.lmptr", "game.exe+0x0 -> 0x0 -> 0x20\n");
 }
 
-test "findPointerPaths: emits absolute bases when module bases are optional" {
+test "PointerPathFinder: emits absolute bases when module bases are optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1027,11 +1020,14 @@ test "findPointerPaths: emits absolute bases when module bases are optional" {
         var writer = try PointerMapWriter.init(io, file, 8, &.{});
         defer writer.deinit();
 
-        const found = try findPointerPaths(std.testing.allocator, &index, &.{}, .{
+        var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
             .max_depth = 1,
             .max_positive_offset = 0x40,
-        }, 0x6020, &writer);
-        try std.testing.expectEqual(0, found);
+        });
+        defer finder.deinit();
+
+        try finder.findPathsToValue(0x6020, &writer);
+        try std.testing.expectEqual(0, finder.results_found);
         try writer.finish();
     }
 
@@ -1040,19 +1036,22 @@ test "findPointerPaths: emits absolute bases when module bases are optional" {
         var writer = try PointerMapWriter.init(io, file, 8, &.{});
         defer writer.deinit();
 
-        const found = try findPointerPaths(std.testing.allocator, &index, &.{}, .{
+        var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
             .max_depth = 1,
             .max_positive_offset = 0x40,
             .module_base_only = false,
-        }, 0x6020, &writer);
-        try std.testing.expectEqual(1, found);
+        });
+        defer finder.deinit();
+
+        try finder.findPathsToValue(0x6020, &writer);
+        try std.testing.expectEqual(1, finder.results_found);
         try writer.finish();
     }
 
     try expectMapText(io, tmp.dir, "absolute.lmptr", "0x3000 -> 0x20\n");
 }
 
-test "findPointerPaths: avoids cyclic paths" {
+test "PointerPathFinder: avoids cyclic paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1073,11 +1072,14 @@ test "findPointerPaths: avoids cyclic paths" {
         var writer = try PointerMapWriter.init(io, file, 8, &modules);
         defer writer.deinit();
 
-        const found = try findPointerPaths(std.testing.allocator, &index, &modules, .{
+        var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
             .max_depth = 4,
             .max_positive_offset = 0,
-        }, 0x2000, &writer);
-        try std.testing.expectEqual(2, found);
+        });
+        defer finder.deinit();
+
+        try finder.findPathsToValue(0x2000, &writer);
+        try std.testing.expectEqual(2, finder.results_found);
         try writer.finish();
     }
 
@@ -1252,7 +1254,7 @@ test "appendEntriesFromChunk: returns zero advance when buffer is smaller than p
     try std.testing.expectEqual(0, entries.items.len);
 }
 
-test "findPointerPaths: supports negative offsets and result limits" {
+test "PointerPathFinder: supports negative offsets and result limits" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1273,13 +1275,16 @@ test "findPointerPaths: supports negative offsets and result limits" {
         var writer = try PointerMapWriter.init(io, file, 8, &modules);
         defer writer.deinit();
 
-        const found = try findPointerPaths(std.testing.allocator, &index, &modules, .{
+        var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
             .max_depth = 1,
             .max_positive_offset = 0,
             .max_negative_offset = 0x40,
             .max_results = 1,
-        }, 0x5020, &writer);
-        try std.testing.expectEqual(1, found);
+        });
+        defer finder.deinit();
+
+        try finder.findPathsToValue(0x5020, &writer);
+        try std.testing.expectEqual(1, finder.results_found);
         try writer.finish();
     }
 
