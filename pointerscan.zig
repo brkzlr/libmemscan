@@ -342,7 +342,7 @@ const PointerBaseKind = enum(u8) {
 
 // Maybe change this struct to only contain header values for easier writing/reading to the map file
 // and move the helper values elsewhere.
-const PointerMapHeader = struct {
+pub const PointerMapHeader = struct {
     const size = 24;
 
     // Fixed map file header fields.
@@ -356,8 +356,8 @@ const PointerMapHeader = struct {
     // Encoding and validation values.
     const endianness = .little;
     const max_modules = std.math.maxInt(u16) + 1;
-    const max_module_name_len = std.Io.Dir.max_name_bytes;
-    const max_offsets_per_path = std.math.maxInt(u8); // max u8 because PointerScanOptions.max_depth is an u8
+    pub const max_module_name_len = std.Io.Dir.max_name_bytes;
+    pub const max_offsets_per_path = std.math.maxInt(u8); // max u8 because PointerScanOptions.max_depth is an u8
 };
 
 pub const PointerMapWriter = struct {

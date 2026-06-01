@@ -75,7 +75,8 @@ class Status(IntEnum):
     POINTER_MAP_CREATE_FAILED = 32
     POINTER_MAP_READ_FAILED = 33
     POINTER_MAP_WRITE_FAILED = 34
-    OPTION_REQUIRES_RESET = 35
+    POINTER_MAP_END = 35
+    OPTION_REQUIRES_RESET = 36
 
 
 class ScanLevel(IntEnum):
@@ -144,6 +145,8 @@ WILDCARD_FIXED = 0xFF
 WILDCARD_ANY = 0x00
 _MAX_SIZE_T = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
 _MAX_U64 = (1 << 64) - 1
+_MAX_MODULE_NAME_LEN = 255  # PointerMapHeader.max_module_name_len (std.Io.Dir.max_name_bytes)
+_MAX_OFFSETS_PER_PATH = 255  # PointerMapHeader.max_offsets_per_path (max u8)
 
 
 class ValueData(ctypes.Union):
@@ -220,6 +223,18 @@ class AbiPointerScanOptions(ctypes.Structure):
         ("max_positive_offset", ctypes.c_size_t),
         ("max_negative_offset", ctypes.c_size_t),
         ("max_results", ctypes.c_uint64),
+    ]
+
+
+class AbiPointerPathRecord(ctypes.Structure):
+    _fields_ = [
+        ("base_kind", ctypes.c_uint8),  # 0 = module-relative, 1 = absolute
+        ("module_index", ctypes.c_uint32),  # only valid when base_kind == 0
+        ("base_value", ctypes.c_int64),  # module: signed offset; absolute: address (mask with _MAX_U64)
+        ("module_name_len", ctypes.c_uint32),
+        ("module_name", ctypes.c_uint8 * _MAX_MODULE_NAME_LEN),
+        ("offset_count", ctypes.c_uint32),
+        ("offsets", ctypes.c_int64 * _MAX_OFFSETS_PER_PATH),
     ]
 
 
@@ -447,6 +462,8 @@ class Libmemscan:
             "lm_pointer_scan": [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.POINTER(AbiPointerScanOptions), ctypes.POINTER(ctypes.c_uint64)],
             "lm_pointer_map_compare": [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)],
             "lm_pointer_map_dump_text": [ctypes.c_char_p, ctypes.c_char_p],
+            "lm_pointer_map_open": [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)],
+            "lm_pointer_map_next": [ctypes.c_void_p, ctypes.POINTER(AbiPointerPathRecord)],
             "lm_remove_region_by_id": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_index": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_address": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
@@ -477,6 +494,12 @@ class Libmemscan:
 
         self._lib.lm_pointer_resolve_progress.restype = ctypes.c_double
         self._lib.lm_pointer_resolve_progress.argtypes = [ctypes.c_void_p]
+
+        self._lib.lm_pointer_map_path_count.restype = ctypes.c_uint64
+        self._lib.lm_pointer_map_path_count.argtypes = [ctypes.c_void_p]
+
+        self._lib.lm_pointer_map_close.restype = None
+        self._lib.lm_pointer_map_close.argtypes = [ctypes.c_void_p]
 
     def _status_name(self, status: int) -> str:
         return decode(self._lib.lm_status_name(status))
@@ -795,6 +818,49 @@ class Libmemscan:
             ),
             "dump_pointer_map_text",
         )
+
+    def pointer_map_path_count(self, map_path: object) -> int:
+        """Returns the number of pointer paths recorded in a pointer map (read from its header)."""
+        path = self._path_bytes(map_path)
+        reader = ctypes.c_void_p()
+        self._check(self._lib.lm_pointer_map_open(path, ctypes.byref(reader)), "pointer_map_open")
+        try:
+            return int(self._lib.lm_pointer_map_path_count(reader))
+        finally:
+            self._lib.lm_pointer_map_close(reader)
+
+    def iter_pointer_map(self, map_path: object) -> Generator[tuple[str, list[int]], None, None]:
+        """Streams a binary pointer map, yielding (base, offsets) per path.
+
+        "base" is rebuilt to match libmemscan's text form: "module+0xHEX"/"module-0xHEX" for
+        module-relative bases and "0xHEX" for absolute ones.
+        "offsets" are the raw signed offsets.
+        """
+        path = self._path_bytes(map_path)
+        reader = ctypes.c_void_p()
+        self._check(self._lib.lm_pointer_map_open(path, ctypes.byref(reader)), "pointer_map_open")
+        try:
+            record = AbiPointerPathRecord()
+            module_names: dict[int, str] = {}  # cache so a shared module name is decoded once, not per path
+            while True:
+                status = self._lib.lm_pointer_map_next(reader, ctypes.byref(record))
+                if status == Status.POINTER_MAP_END:
+                    return
+                self._check(status, "pointer_map_next")
+
+                offsets = list(record.offsets[: record.offset_count])
+                if record.base_kind == 0:  # module-relative
+                    name = module_names.get(record.module_index)
+                    if name is None:
+                        name = decode(bytes(record.module_name[: record.module_name_len]), errors="replace")
+                        module_names[record.module_index] = name
+                    offset = record.base_value
+                    base = f"{name}-0x{-offset:X}" if offset < 0 else f"{name}+0x{offset:X}"
+                else:  # absolute
+                    base = f"0x{record.base_value & _MAX_U64:X}"
+                yield base, offsets
+        finally:
+            self._lib.lm_pointer_map_close(reader)
 
     def get_match_count(self) -> int:
         return int(self._lib.lm_match_count(self._scanner))

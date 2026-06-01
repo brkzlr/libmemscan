@@ -57,6 +57,8 @@ const AbiScanner = struct {
 
 pub const LmScanner = opaque {};
 
+pub const LmPointerMapReader = opaque {};
+
 pub const LmStatus = enum(c_int) {
     OK = 0,
     INVALID_ARGUMENT = 1,
@@ -93,7 +95,8 @@ pub const LmStatus = enum(c_int) {
     POINTER_MAP_CREATE_FAILED = 32,
     POINTER_MAP_READ_FAILED = 33,
     POINTER_MAP_WRITE_FAILED = 34,
-    OPTION_REQUIRES_RESET = 35,
+    POINTER_MAP_END = 35,
+    OPTION_REQUIRES_RESET = 36,
 };
 
 pub const LmDataType = enum(c_int) {
@@ -167,6 +170,19 @@ pub const LmPointerScanOptions = extern struct {
     max_results: u64,
 };
 
+const lm_max_offsets_per_path = pointerscan.PointerMapHeader.max_offsets_per_path;
+const lm_max_module_name_len = pointerscan.PointerMapHeader.max_module_name_len;
+
+pub const LmPointerPathRecord = extern struct {
+    base_kind: u8, // 0 = module-relative, 1 = absolute
+    module_index: u32, // only valid when base_kind == 0
+    base_value: i64, // module: signed offset from module base; absolute: address (reinterpret bits as u64)
+    module_name_len: u32, // 0 if base_kind == 1 otherwise length of module_name
+    module_name: [lm_max_module_name_len]u8, // only valid when base_kind == 0, not NUL-terminated
+    offset_count: u32,
+    offsets: [lm_max_offsets_per_path]i64,
+};
+
 pub const LmUserValue = extern struct {
     int8_value: i8 = 0,
     uint8_value: u8 = 0,
@@ -185,6 +201,11 @@ pub const LmUserValue = extern struct {
 };
 
 fn toHandle(raw: ?*LmScanner) ?*AbiScanner {
+    const ptr = raw orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn toPointerMapReader(raw: ?*LmPointerMapReader) ?*PointerMapReader {
     const ptr = raw orelse return null;
     return @ptrCast(@alignCast(ptr));
 }
@@ -324,6 +345,7 @@ pub export fn lm_status_name(status_code: c_int) [*:0]const u8 {
         @intFromEnum(LmStatus.POINTER_MAP_CREATE_FAILED) => "POINTER_MAP_CREATE_FAILED",
         @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED) => "POINTER_MAP_READ_FAILED",
         @intFromEnum(LmStatus.POINTER_MAP_WRITE_FAILED) => "POINTER_MAP_WRITE_FAILED",
+        @intFromEnum(LmStatus.POINTER_MAP_END) => "POINTER_MAP_END",
         @intFromEnum(LmStatus.OPTION_REQUIRES_RESET) => "OPTION_REQUIRES_RESET",
         else => "INVALID_STATUS",
     };
@@ -564,6 +586,72 @@ pub export fn lm_pointer_map_dump_text(map_path: ?[*:0]const u8, output_text_pat
     reader.dumpText(&output_writer.interface) catch |err| return @intFromEnum(statusFrom(err));
     output_writer.flush() catch return @intFromEnum(LmStatus.WRITE_FAILED);
     return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_pointer_map_open(map_path: ?[*:0]const u8, out_reader: ?*?*LmPointerMapReader) c_int {
+    const out = out_reader orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const input_path = absolutePathFromAbi(map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const input_file = std.Io.Dir.openFileAbsolute(io, input_path, .{}) catch return @intFromEnum(LmStatus.POINTER_MAP_READ_FAILED);
+
+    const reader = c_allocator.create(PointerMapReader) catch {
+        input_file.close(io);
+        return @intFromEnum(LmStatus.OUT_OF_MEMORY);
+    };
+    // PointerMapReader.init takes ownership of input_file and closes it via its own errdefer on failure.
+    reader.* = PointerMapReader.init(c_allocator, io, input_file) catch |err| {
+        c_allocator.destroy(reader);
+        return @intFromEnum(statusFrom(err));
+    };
+
+    out.* = @ptrCast(reader);
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_pointer_map_path_count(raw: ?*LmPointerMapReader) u64 {
+    const reader = toPointerMapReader(raw) orelse return 0;
+    return reader.path_count;
+}
+
+pub export fn lm_pointer_map_next(raw: ?*LmPointerMapReader, out_record: ?*LmPointerPathRecord) c_int {
+    const reader = toPointerMapReader(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const out = out_record orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    var owned_path = (reader.next() catch |err| return @intFromEnum(statusFrom(err))) orelse
+        return @intFromEnum(LmStatus.POINTER_MAP_END);
+    defer owned_path.deinit();
+
+    const path = owned_path.path;
+    switch (path.base) {
+        .module => |base_ref| {
+            // next() already validated module_index against the module table, so indexing is safe here.
+            const name = reader.modules[base_ref.module_index].name;
+            out.base_kind = 0;
+            out.module_index = base_ref.module_index;
+            out.base_value = base_ref.offset;
+            out.module_name_len = @intCast(name.len);
+            @memcpy(out.module_name[0..name.len], name);
+        },
+        .absolute => |address| {
+            out.base_kind = 1;
+            out.module_index = 0;
+            out.base_value = @bitCast(@as(u64, address));
+            out.module_name_len = 0;
+        },
+    }
+
+    out.offset_count = @intCast(path.offsets.len);
+    for (path.offsets, 0..) |offset, index| {
+        out.offsets[index] = offset;
+    }
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_pointer_map_close(raw: ?*LmPointerMapReader) void {
+    const reader = toPointerMapReader(raw) orelse return;
+    reader.deinit();
+    c_allocator.destroy(reader);
 }
 
 pub export fn lm_remove_region_by_id(raw: ?*LmScanner, region_id: usize, removed: ?*bool) c_int {
