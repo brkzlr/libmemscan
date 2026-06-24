@@ -417,7 +417,7 @@ class RegionView:
 
 @dataclass
 class PointerScanOptions:
-    pointer_width: int = ctypes.sizeof(ctypes.c_size_t)
+    pointer_width: int
     endianness: PointerEndianness = PointerEndianness.NATIVE
     max_depth: int = 5
     module_base_only: bool = True
@@ -775,11 +775,11 @@ class Libmemscan:
         raw.max_results = 0 if options.max_results is None else options.max_results
         return raw
 
-    def pointer_scan(self, target_address: int, output_map_path: object, options: Optional[PointerScanOptions] = None) -> int:
+    def pointer_scan(self, target_address: int, output_map_path: object, options: PointerScanOptions) -> int:
         if type(target_address) is not int or not 0 <= target_address <= _MAX_SIZE_T:
             raise ValueError("target_address must fit in size_t")
 
-        raw_options = self._make_pointer_scan_options(options if options is not None else PointerScanOptions())
+        raw_options = self._make_pointer_scan_options(options)
         path = self._path_bytes(output_map_path)
         paths_found = ctypes.c_uint64()
         self._check(

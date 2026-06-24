@@ -48,8 +48,8 @@ pub const PointerEntry = struct {
 pub const PointerScanOptions = struct {
     const chunk_size = 1 << 20;
 
-    /// Width of pointers read from target memory. 4 for 32-bit targets and 8 for 64-bit targets.
-    pointer_width: u8 = @sizeOf(usize),
+    /// Width of pointers read from target memory. Must be 4 for 32-bit targets and 8 for 64-bit targets.
+    pointer_width: u8,
     /// Endianness used when decoding pointer values from target memory.
     endianness: std.builtin.Endian = .native,
     /// Maximum number of offsets in a result path.
@@ -967,9 +967,9 @@ test "PointerPath.formatText: rejects out-of-range module references" {
 }
 
 test "PointerScanOptions: validates public scan limits and chunk read size" {
-    try (PointerScanOptions{}).validate();
+    try (PointerScanOptions{ .pointer_width = @sizeOf(usize) }).validate();
     try std.testing.expectError(PointerScanError.InvalidOptions, (PointerScanOptions{ .pointer_width = 3 }).validate());
-    try std.testing.expectError(PointerScanError.InvalidOptions, (PointerScanOptions{ .max_depth = 0 }).validate());
+    try std.testing.expectError(PointerScanError.InvalidOptions, (PointerScanOptions{ .pointer_width = @sizeOf(usize), .max_depth = 0 }).validate());
     try std.testing.expectEqual(PointerScanOptions.chunk_size + 3, try (PointerScanOptions{ .pointer_width = 4 }).maxChunkReadSize());
     try std.testing.expectEqual(PointerScanOptions.chunk_size + 7, try (PointerScanOptions{ .pointer_width = 8 }).maxChunkReadSize());
 }
@@ -1014,6 +1014,7 @@ test "PointerPathFinder: finds static paths from synthetic entries" {
         defer writer.deinit();
 
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
+            .pointer_width = @sizeOf(usize),
             .max_depth = 3,
             .max_positive_offset = 0x100,
         });
@@ -1047,6 +1048,7 @@ test "PointerPathFinder: reports path-finding progress" {
     defer writer.deinit();
 
     var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
+        .pointer_width = @sizeOf(usize),
         .max_depth = 1,
         .max_positive_offset = 0x1000,
     });
@@ -1078,6 +1080,7 @@ test "PointerPathFinder: emits absolute bases when module bases are optional" {
         defer writer.deinit();
 
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
+            .pointer_width = @sizeOf(usize),
             .max_depth = 1,
             .max_positive_offset = 0x40,
         });
@@ -1094,6 +1097,7 @@ test "PointerPathFinder: emits absolute bases when module bases are optional" {
         defer writer.deinit();
 
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &.{}, .{
+            .pointer_width = @sizeOf(usize),
             .max_depth = 1,
             .max_positive_offset = 0x40,
             .module_base_only = false,
@@ -1130,6 +1134,7 @@ test "PointerPathFinder: avoids cyclic paths" {
         defer writer.deinit();
 
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
+            .pointer_width = @sizeOf(usize),
             .max_depth = 4,
             .max_positive_offset = 0,
         });
@@ -1333,6 +1338,7 @@ test "PointerPathFinder: supports negative offsets and result limits" {
         defer writer.deinit();
 
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
+            .pointer_width = @sizeOf(usize),
             .max_depth = 1,
             .max_positive_offset = 0,
             .max_negative_offset = 0x40,

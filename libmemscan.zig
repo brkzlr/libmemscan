@@ -518,7 +518,8 @@ pub export fn lm_pointer_scan(raw: ?*LmScanner, target_address: usize, output_ma
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
     const path = absolutePathFromAbi(output_map_path) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
 
-    const scan_options: PointerScanOptions = if (options) |abi| .{
+    const abi = options orelse return @intFromEnum(LmStatus.INVALID_POINTER_SCAN_OPTIONS);
+    const scan_options: PointerScanOptions = .{
         .pointer_width = abi.pointer_width,
         .endianness = switch (abi.endianness) {
             @intFromEnum(LmPointerEndianness.NATIVE) => .native,
@@ -531,7 +532,7 @@ pub export fn lm_pointer_scan(raw: ?*LmScanner, target_address: usize, output_ma
         .max_negative_offset = abi.max_negative_offset,
         .max_results = if (abi.has_max_results) abi.max_results else null,
         .module_base_only = abi.module_base_only,
-    } else .{};
+    };
     const paths_found = handle.scanner.scanPointers(target_address, path, scan_options) catch |err| return @intFromEnum(statusFrom(err));
 
     if (out_paths_found) |out| out.* = paths_found;
