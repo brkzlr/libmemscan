@@ -666,7 +666,11 @@ pub const Scanner = struct {
                 const remaining = region.size - region_offset;
                 const read_size = @min(remaining, chunk_payload_size + overlap);
                 const bytes_read = handle.read(region.start + region_offset, buffer[0..read_size]) catch 0;
-                if (bytes_read == 0) break;
+                if (bytes_read == 0) {
+                    skipInitialScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                    required_extra_bytes = 0;
+                    continue;
+                }
                 const scan_chunk = initialScanChunkDecision(region_offset, region.size, bytes_read, read_size, overlap);
 
                 try scanChunkIntoMatches(
@@ -687,7 +691,10 @@ pub const Scanner = struct {
                 updateProgress(self, processed_bytes, total_bytes);
 
                 if (scan_chunk.scan_limit == 0) break;
-                if (scan_chunk.stop_region) break;
+                if (scan_chunk.stop_region) {
+                    skipInitialScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                    required_extra_bytes = 0;
+                }
             }
 
             required_extra_bytes = 0;
@@ -2891,6 +2898,20 @@ fn initialScanChunkDecision(
         .scan_limit = scan_limit,
         .stop_region = short_read,
     };
+}
+
+fn skipInitialScanReadHole(
+    scanner: *Scanner,
+    region: Region,
+    region_offset: *usize,
+    processed_bytes: *usize,
+    total_bytes: usize,
+) void {
+    const skip = std.heap.page_size_min - (region.start + region_offset.*) % std.heap.page_size_min;
+    const next_offset = @min(region.size, region_offset.* + skip);
+    processed_bytes.* += next_offset - region_offset.*;
+    region_offset.* = next_offset;
+    updateProgress(scanner, processed_bytes.*, total_bytes);
 }
 
 fn totalRegionBytes(regions: []const Region) usize {
