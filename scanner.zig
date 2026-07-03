@@ -404,7 +404,7 @@ pub const Scanner = struct {
             try self.initialScan(match_type, user_values);
             self.fresh_session = false;
         } else {
-            try self.saveCurrentMatchesForUndo();
+            if (match_type != .MATCHUPDATE) try self.saveCurrentMatchesForUndo();
             try self.rescanMatches(match_type, user_values);
         }
     }
