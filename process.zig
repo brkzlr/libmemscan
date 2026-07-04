@@ -400,6 +400,15 @@ const darwin = std.posix.system;
 extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
 extern "c" fn proc_regionfilename(pid: c_int, address: u64, buffer: [*]u8, buffersize: u32) c_int;
 
+// TODO: Use zig darwin's version if/when this PR (https://codeberg.org/ziglang/zig/pulls/36042) gets upstreamed.
+extern "c" fn mach_vm_read_overwrite(
+    target_task: darwin.vm_map_read_t,
+    address: darwin.mach_vm_address_t,
+    size: darwin.mach_vm_size_t,
+    data: darwin.mach_vm_address_t,
+    outsize: *darwin.mach_vm_size_t,
+) darwin.kern_return_t;
+
 const MacOSBackend = struct {
     target_task: darwin.mach_port_t,
 
@@ -417,7 +426,7 @@ const MacOSBackend = struct {
     }
 
     fn read(self: *MacOSBackend, _: std.Io, addr: usize, buf: []u8) ProcessError!usize {
-        // We want to gate mach_vm_read size due to the allocations it does.
+        // Keep reads bounded so inaccessible edges can still return partial progress.
         const max_chunk: usize = 64 * 1024;
         var nread: usize = 0;
 
@@ -425,25 +434,21 @@ const MacOSBackend = struct {
             const remaining = buf.len - nread;
             const read_size = @min(remaining, max_chunk);
 
-            // mach_vm_read allocates memory in our own process space and then copies bytes from the target_task
-            // addr to the allocated data buffer.
-            // data_addr represents the address where our newly allocated memory containing the data resides.
-            // data_count represents the size of copied bytes.
-            var data_addr: darwin.vm_offset_t = 0;
-            var data_count: darwin.mach_msg_type_number_t = 0;
-            const kern_result = darwin.mach_vm_read(self.target_task, addr + nread, read_size, &data_addr, &data_count);
+            // mach_vm_read_overwrite copies bytes from the target_task address directly into our existing buffer.
+            // Unlike mach_vm_read, it does not allocate a temporary buffer in our process that we then have to copy from and vm_deallocate.
+            var out_size: darwin.mach_vm_size_t = 0;
+            const kern_result = mach_vm_read_overwrite(
+                self.target_task,
+                addr + nread,
+                read_size,
+                @intFromPtr(buf[nread..].ptr),
+                &out_size,
+            );
 
             if (kern_result != 0) return if (nread == 0) ProcessError.ReadFailed else nread;
-            if (data_count == 0) break;
+            if (out_size == 0) break;
 
-            const read_count = @min(read_size, data_count);
-
-            const src: [*]const u8 = @ptrFromInt(data_addr);
-            @memcpy(buf[nread .. nread + read_count], src[0..read_count]);
-
-            // We have to deallocate mach_vm_read allocations once we've copied the data to our internal buffer.
-            _ = darwin.vm_deallocate(darwin.mach_task_self(), data_addr, data_count);
-
+            const read_count = @min(read_size, out_size);
             nread += read_count;
             if (read_count < read_size) break;
         }
