@@ -133,6 +133,9 @@ pub const ValidPointerValueRanges = struct {
     }
 
     pub fn contains(self: *const ValidPointerValueRanges, value: usize) bool {
+        if (self.ranges.len == 0) return false;
+        if (value < self.ranges[0].start or value >= self.ranges[self.ranges.len - 1].end) return false;
+
         var left: usize = 0;
         var right = self.ranges.len;
 
@@ -161,10 +164,12 @@ pub const PointerReverseIndex = struct {
 
     pub fn fromEntries(allocator: Allocator, entries: []const PointerEntry) PointerScanError!PointerReverseIndex {
         const owned_entries = allocator.alloc(PointerEntry, entries.len) catch return PointerScanError.OutOfMemory;
-        errdefer allocator.free(owned_entries);
-
         @memcpy(owned_entries, entries);
+        return fromOwnedEntries(allocator, owned_entries);
+    }
 
+    /// Takes ownership of "entries".
+    pub fn fromOwnedEntries(allocator: Allocator, entries: []PointerEntry) PointerReverseIndex {
         // Reverse scans need range lookups by pointed-to value, then stable address order inside each value.
         const EntryOrder = struct {
             fn lessThan(_: void, lhs: PointerEntry, rhs: PointerEntry) bool {
@@ -172,11 +177,11 @@ pub const PointerReverseIndex = struct {
                 return lhs.value < rhs.value;
             }
         };
-        std.mem.sortUnstable(PointerEntry, owned_entries, {}, EntryOrder.lessThan);
+        std.mem.sortUnstable(PointerEntry, entries, {}, EntryOrder.lessThan);
 
         return .{
             .allocator = allocator,
-            .entries = owned_entries,
+            .entries = entries,
         };
     }
 
@@ -1195,6 +1200,7 @@ test "ValidPointerValueRanges: merges ranges and checks containment" {
     defer ranges.deinit();
 
     try std.testing.expectEqual(2, ranges.len());
+    try std.testing.expect(!ranges.contains(0));
     try std.testing.expect(ranges.contains(0x1000));
     try std.testing.expect(ranges.contains(0x11FF));
     try std.testing.expect(!ranges.contains(0x1200));

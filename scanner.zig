@@ -467,11 +467,20 @@ pub const Scanner = struct {
                     const read_size = @min(region_remaining, max_read_size);
 
                     const chunk_address = region.start + region_offset;
-                    const bytes_read = handle.read(chunk_address, buffer[0..read_size]) catch break;
-                    if (bytes_read == 0) break;
+                    const bytes_read = handle.read(chunk_address, buffer[0..read_size]) catch {
+                        skipScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                        continue;
+                    };
+                    if (bytes_read == 0) {
+                        skipScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                        continue;
+                    }
 
                     const scan_advance = try pointerscan.appendEntriesFromChunk(self.allocator, &entries, chunk_address, buffer[0..bytes_read], options, &valid_pointer_values);
-                    if (scan_advance == 0) break;
+                    if (scan_advance == 0) {
+                        skipScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                        continue;
+                    }
 
                     region_offset += scan_advance;
                     processed_bytes += scan_advance;
@@ -483,7 +492,8 @@ pub const Scanner = struct {
         }
         self.scan_progress = 1.0;
 
-        var index = try pointerscan.PointerReverseIndex.fromEntries(self.allocator, entries.items);
+        const owned_entries = entries.toOwnedSlice(self.allocator) catch return ScannerError.OutOfMemory;
+        var index = pointerscan.PointerReverseIndex.fromOwnedEntries(self.allocator, owned_entries);
         defer index.deinit();
 
         const modules = try pointerscan.moduleBasesFromRegions(self.allocator, self.regions);
@@ -667,7 +677,7 @@ pub const Scanner = struct {
                 const read_size = @min(remaining, chunk_payload_size + overlap);
                 const bytes_read = handle.read(region.start + region_offset, buffer[0..read_size]) catch 0;
                 if (bytes_read == 0) {
-                    skipInitialScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                    skipScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
                     required_extra_bytes = 0;
                     continue;
                 }
@@ -692,7 +702,7 @@ pub const Scanner = struct {
 
                 if (scan_chunk.scan_limit == 0) break;
                 if (scan_chunk.stop_region) {
-                    skipInitialScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
+                    skipScanReadHole(self, region, &region_offset, &processed_bytes, total_bytes);
                     required_extra_bytes = 0;
                 }
             }
@@ -2900,7 +2910,7 @@ fn initialScanChunkDecision(
     };
 }
 
-fn skipInitialScanReadHole(
+fn skipScanReadHole(
     scanner: *Scanner,
     region: Region,
     region_offset: *usize,
