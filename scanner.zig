@@ -263,12 +263,16 @@ pub const Scanner = struct {
     }
 
     pub fn matchAt(self: *const Scanner, match_index: usize) ScannerError!MatchRecord {
-        const matches = self.matches orelse return ScannerError.NoMatches;
+        const matches = if (self.matches) |*m| m else return ScannerError.NoMatches;
         const location = matches.nthMatch(match_index) orelse return ScannerError.MatchIndexOutOfRange;
+        return self.matchRecordFromLocation(matches, match_index, location);
+    }
+
+    pub fn matchRecordFromLocation(self: *const Scanner, matches: *const MatchesArray, match_index: usize, location: targetmem.MatchLocation) MatchRecord {
         return .{
             .index = match_index,
             .address = location.address,
-            .stored_value = decodeValueForTargetEndian(self.options.scan_data_type, self.options.reverse_endianness, location.value(&matches)),
+            .stored_value = decodeValueForTargetEndian(self.options.scan_data_type, self.options.reverse_endianness, location.value(matches)),
             .raw_match_info_bits = location.raw_match_info_bits,
         };
     }
@@ -565,8 +569,12 @@ pub const Scanner = struct {
     }
 
     pub fn storedMatchBytes(self: *const Scanner, match_index: usize, buf: []u8) ScannerError![]const u8 {
-        const matches = self.matches orelse return ScannerError.NoMatches;
+        const matches = if (self.matches) |*m| m else return ScannerError.NoMatches;
         const location = matches.nthMatch(match_index) orelse return ScannerError.MatchIndexOutOfRange;
+        return self.storedMatchBytesAtLocation(matches, location, buf);
+    }
+
+    pub fn storedMatchBytesAtLocation(self: *const Scanner, matches: *const MatchesArray, location: targetmem.MatchLocation, buf: []u8) ScannerError![]const u8 {
         const length = storedLengthForExistingMatch(self.options.scan_data_type, location.raw_match_info_bits);
         if (length == 0) return ScannerError.UnsupportedReadDataType;
         if (buf.len < length) return ScannerError.BufferTooSmall;

@@ -464,6 +464,9 @@ class Libmemscan:
             "lm_pointer_map_dump_text": [ctypes.c_char_p, ctypes.c_char_p],
             "lm_pointer_map_open": [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)],
             "lm_pointer_map_next": [ctypes.c_void_p, ctypes.POINTER(AbiPointerPathRecord)],
+            "lm_match_iterator_open": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+            "lm_match_iterator_next": [ctypes.c_void_p, ctypes.POINTER(MatchRecord)],
+            "lm_match_iterator_stored_match_bytes": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)],
             "lm_remove_region_by_id": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_index": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
             "lm_remove_match_by_address": [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_bool)],
@@ -500,6 +503,9 @@ class Libmemscan:
 
         self._lib.lm_pointer_map_close.restype = None
         self._lib.lm_pointer_map_close.argtypes = [ctypes.c_void_p]
+
+        self._lib.lm_match_iterator_close.restype = None
+        self._lib.lm_match_iterator_close.argtypes = [ctypes.c_void_p]
 
     def _status_name(self, status: int) -> str:
         return decode(self._lib.lm_status_name(status))
@@ -972,22 +978,25 @@ class Libmemscan:
             return 1
         return 0
 
-    def _stored_match_bytes(self, match_index: int, record: MatchRecord) -> bytes:
+    def _stored_match_bytes(self, match_index: int, record: MatchRecord, iterator: Optional[ctypes.c_void_p] = None) -> bytes:
         buf_len = self._match_length(record)
         buf = (ctypes.c_uint8 * max(buf_len, 1))()
         out_len = ctypes.c_size_t()
-        self._check(
-            self._lib.lm_get_stored_match_bytes(self._scanner, match_index, buf, buf_len, ctypes.byref(out_len)),
-            "get_stored_match_bytes",
-        )
+        if iterator is None:
+            status = self._lib.lm_get_stored_match_bytes(self._scanner, match_index, buf, buf_len, ctypes.byref(out_len))
+            operation = "get_stored_match_bytes"
+        else:
+            status = self._lib.lm_match_iterator_stored_match_bytes(iterator, buf, buf_len, ctypes.byref(out_len))
+            operation = "match_iterator_stored_match_bytes"
+        self._check(status, operation)
         return bytes(buf[: out_len.value])
 
     def get_stored_match_bytes(self, match_index: int) -> bytes:
         return self._stored_match_bytes(match_index, self.get_match(match_index))
 
-    def _stored_match_value(self, match_index: int, record: MatchRecord) -> object:
+    def _stored_match_value(self, match_index: int, record: MatchRecord, iterator: Optional[ctypes.c_void_p] = None) -> object:
         if self._data_type in (DataType.BYTEARRAY, DataType.STRING):
-            return self._stored_match_bytes(match_index, record)
+            return self._stored_match_bytes(match_index, record, iterator)
         return record.stored_value
 
     def get_stored_match_value(self, match_index: int) -> object:
@@ -1036,13 +1045,24 @@ class Libmemscan:
         )
 
     def matches(self) -> Generator[MatchView, None, None]:
-        count = self.get_match_count()
-        for index in range(count):
-            record = self.get_match(index)
-            yield MatchView(
-                index=record.index,
-                address=record.address,
-                data_type=self._data_type,
-                match_info=MatchFlagsView(record.raw_match_info_bits),
-                stored_value=self._stored_match_value(index, record),
-            )
+        iterator = ctypes.c_void_p()
+        status = self._lib.lm_match_iterator_open(self._scanner, ctypes.byref(iterator))
+        if status == Status.NO_MATCHES:
+            return
+        self._check(status, "match_iterator_open")
+        try:
+            while True:
+                record = MatchRecord()
+                status = self._lib.lm_match_iterator_next(iterator, ctypes.byref(record))
+                if status == Status.NO_MATCHES:
+                    return
+                self._check(status, "match_iterator_next")
+                yield MatchView(
+                    index=record.index,
+                    address=record.address,
+                    data_type=self._data_type,
+                    match_info=MatchFlagsView(record.raw_match_info_bits),
+                    stored_value=self._stored_match_value(record.index, record, iterator),
+                )
+        finally:
+            self._lib.lm_match_iterator_close(iterator)

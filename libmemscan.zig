@@ -55,7 +55,16 @@ const AbiScanner = struct {
     scanner: Scanner,
 };
 
+const AbiMatchIterator = struct {
+    scanner: *Scanner,
+    iterator: targetmem.MatchIterator,
+    index: usize = 0,
+    current: ?targetmem.MatchLocation = null,
+};
+
 pub const LmScanner = opaque {};
+
+pub const LmMatchIterator = opaque {};
 
 pub const LmPointerMapReader = opaque {};
 
@@ -200,14 +209,16 @@ pub const LmUserValue = extern struct {
     flags_bits: u16 = 0,
 };
 
-fn toHandle(raw: ?*LmScanner) ?*AbiScanner {
-    const ptr = raw orelse return null;
-    return @ptrCast(@alignCast(ptr));
+inline fn toHandle(raw: ?*LmScanner) ?*AbiScanner {
+    return @ptrCast(@alignCast(raw orelse return null));
 }
 
-fn toPointerMapReader(raw: ?*LmPointerMapReader) ?*PointerMapReader {
-    const ptr = raw orelse return null;
-    return @ptrCast(@alignCast(ptr));
+inline fn toMatchIterator(raw: ?*LmMatchIterator) ?*AbiMatchIterator {
+    return @ptrCast(@alignCast(raw orelse return null));
+}
+
+inline fn toPointerMapReader(raw: ?*LmPointerMapReader) ?*PointerMapReader {
+    return @ptrCast(@alignCast(raw orelse return null));
 }
 
 fn absolutePathFromAbi(raw: ?[*:0]const u8) ?[]const u8 {
@@ -263,6 +274,15 @@ fn statusFrom(err: anyerror) LmStatus {
         => .PARSE_FAILED,
         error.LossyConversion => .CONVERSION_FAILED,
         else => .INTERNAL_ERROR,
+    };
+}
+
+fn lmMatchRecordFrom(record: scanner.MatchRecord) LmMatchRecord {
+    return .{
+        .index = record.index,
+        .address = record.address,
+        .stored_value = record.stored_value,
+        .raw_match_info_bits = record.raw_match_info_bits,
     };
 }
 
@@ -718,16 +738,55 @@ pub export fn lm_find_match_index_by_address(raw: ?*LmScanner, address: usize, o
     return @intFromEnum(LmStatus.NO_MATCHES);
 }
 
+pub export fn lm_match_iterator_open(raw: ?*LmScanner, out_iterator: ?*?*LmMatchIterator) c_int {
+    const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const out = out_iterator orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const matches = if (handle.scanner.matches) |*m| m else return @intFromEnum(LmStatus.NO_MATCHES);
+
+    const iterator = c_allocator.create(AbiMatchIterator) catch return @intFromEnum(LmStatus.OUT_OF_MEMORY);
+    iterator.* = .{
+        .scanner = &handle.scanner,
+        .iterator = matches.iterator(),
+    };
+    out.* = @ptrCast(iterator);
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_match_iterator_next(raw: ?*LmMatchIterator, out_record: ?*LmMatchRecord) c_int {
+    const iterator = toMatchIterator(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const out = out_record orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const location = iterator.iterator.next() orelse {
+        iterator.current = null;
+        return @intFromEnum(LmStatus.NO_MATCHES);
+    };
+
+    iterator.current = location;
+    out.* = lmMatchRecordFrom(iterator.scanner.matchRecordFromLocation(iterator.iterator.matches, iterator.index, location));
+    iterator.index += 1;
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_match_iterator_stored_match_bytes(raw: ?*LmMatchIterator, buf: ?[*]u8, buf_len: usize, out_len: ?*usize) c_int {
+    const iterator = toMatchIterator(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const buf_ptr = buf orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+    const location = iterator.current orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
+
+    const bytes = iterator.scanner.storedMatchBytesAtLocation(iterator.iterator.matches, location, buf_ptr[0..buf_len]) catch |err| return @intFromEnum(statusFrom(err));
+    if (out_len) |out| out.* = bytes.len;
+    return @intFromEnum(LmStatus.OK);
+}
+
+pub export fn lm_match_iterator_close(raw: ?*LmMatchIterator) void {
+    const iterator = toMatchIterator(raw) orelse return;
+    c_allocator.destroy(iterator);
+}
+
 pub export fn lm_get_match(raw: ?*LmScanner, match_index: usize, out_record: ?*LmMatchRecord) c_int {
     const handle = toHandle(raw) orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
     const out = out_record orelse return @intFromEnum(LmStatus.INVALID_ARGUMENT);
     const record = handle.scanner.matchAt(match_index) catch |err| return @intFromEnum(statusFrom(err));
-    out.* = .{
-        .index = record.index,
-        .address = record.address,
-        .stored_value = record.stored_value,
-        .raw_match_info_bits = record.raw_match_info_bits,
-    };
+    out.* = lmMatchRecordFrom(record);
     return @intFromEnum(LmStatus.OK);
 }
 
