@@ -207,6 +207,52 @@ const LinuxBackend = struct {
     /// File descriptor for /proc/<pid>/mem — opened once on attach.
     mem_fd: std.Io.File,
 
+    const PeImageSpan = struct {
+        base: usize,
+        end: usize,
+        kind: RegionKind,
+        filename: []const u8, // borrows from the maps content buffer
+    };
+
+    /// Detect a PE image mapped by WINE starting at this region.
+    /// WINE copies most PE sections into anonymous memory since their file offsets are rarely page-aligned,
+    /// but it always maps the header page from the file at offset 0.
+    fn detectPeImageSpan(self: *LinuxBackend, io: std.Io, parsed: MapsLine) ?PeImageSpan {
+        if (parsed.pathname.len == 0 or parsed.pathname[0] != '/' or parsed.offset != 0) return null;
+        if (!parsed.flags.read or parsed.end <= parsed.start) return null;
+
+        var header: [0x1000]u8 = undefined;
+        const slice_size = parsed.end - parsed.start;
+        const nread = self.read(io, parsed.start, header[0..@min(slice_size, header.len)]) catch return null;
+
+        // DOS header: "MZ" magic with e_lfanew (the PE signature offset) at 0x3C.
+        if (nread < 0x40 or header[0] != 'M' or header[1] != 'Z') return null;
+        const pe_offset = std.mem.readInt(u32, header[0x3C..0x40], .little);
+        if (pe_offset >= nread or nread - pe_offset < 0x58) return null;
+
+        const pe = header[pe_offset..];
+        if (!std.mem.eql(u8, pe[0..4], "PE\x00\x00")) return null;
+
+        // Optional header magic: 0x10B (PE32) or 0x20B (PE32+).
+        // SizeOfImage and SizeOfHeaders sit at the same offsets in both variants.
+        const optional_magic = std.mem.readInt(u16, pe[0x18..0x1A], .little);
+        if (optional_magic != 0x10B and optional_magic != 0x20B) return null;
+        const size_of_image = std.mem.readInt(u32, pe[0x50..0x54], .little);
+        const size_of_headers = std.mem.readInt(u32, pe[0x54..0x58], .little);
+
+        // Mappings bigger than the headers are whole PE files mmap'd as plain data (Mono assemblies for example), not loaded images.
+        if (slice_size > std.mem.alignForward(u64, size_of_headers, std.heap.pageSize())) return null;
+        const image_end = parsed.start +| size_of_image;
+        if (image_end <= parsed.end) return null;
+
+        return .{
+            .base = parsed.start,
+            .end = image_end,
+            .kind = if (std.ascii.endsWithIgnoreCase(parsed.pathname, ".exe")) .EXE else .CODE,
+            .filename = parsed.pathname,
+        };
+    }
+
     fn attach(io: std.Io, pid: std.posix.pid_t) ProcessError!LinuxBackend {
         var path_buf: [64]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/mem", .{pid}) catch return ProcessError.AttachFailed;
@@ -244,7 +290,7 @@ const LinuxBackend = struct {
         }
     }
 
-    fn readRegions(_: *LinuxBackend, io: std.Io, pid: std.posix.pid_t, allocator: std.mem.Allocator, level: ScanLevel) ProcessError![]Region {
+    fn readRegions(self: *LinuxBackend, io: std.Io, pid: std.posix.pid_t, allocator: std.mem.Allocator, level: ScanLevel) ProcessError![]Region {
         var path_buf: [64]u8 = undefined;
         const maps_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/maps", .{pid}) catch return ProcessError.RegionEnumFailed;
 
@@ -286,6 +332,9 @@ const LinuxBackend = struct {
         var bin_name: []const u8 = "";
         var region_id: u32 = 0;
 
+        // WINE PE image tracking, see detectPeImageSpan.
+        var pe_span: ?PeImageSpan = null;
+
         var lines = std.mem.splitScalar(u8, maps_content, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) {
@@ -293,6 +342,16 @@ const LinuxBackend = struct {
             }
 
             const parsed = parseMapsLine(line) orelse continue;
+            if (pe_span) |span| {
+                // The span ends at the image end or at a mapping of a different file inside it.
+                if (parsed.start >= span.end or
+                    (parsed.pathname.len > 0 and !std.mem.eql(u8, parsed.pathname, span.filename)))
+                {
+                    pe_span = null;
+                }
+            }
+            if (pe_span == null) pe_span = self.detectPeImageSpan(io, parsed);
+
             // File offsets let all mapped slices of the same ELF image share one load address.
             var region_load_addr = if (parsed.pathname.len > 0 and parsed.offset <= parsed.start)
                 parsed.start - parsed.offset
@@ -346,7 +405,17 @@ const LinuxBackend = struct {
                 continue;
             }
 
+            // Regions inside a PE image span inherit its identity,
+            // as their own pathname/offset data is unreliable under WINE's PE mapping scheme.
+            var region_filename = parsed.pathname;
+            if (pe_span) |span| {
+                region_load_addr = span.base;
+                // .exe images only, so anonymous DLL slices keep their BSS-like scan level inclusion.
+                if (span.kind == .EXE and region_filename.len == 0) region_filename = span.filename;
+            }
+
             const region_kind: RegionKind = blk: {
+                if (pe_span) |span| break :blk span.kind;
                 if (is_exe) break :blk .EXE;
                 if (code_regions > 0) break :blk .CODE;
                 if (std.mem.eql(u8, parsed.pathname, "[heap]")) break :blk .HEAP;
@@ -354,10 +423,10 @@ const LinuxBackend = struct {
                 break :blk .MISC;
             };
 
-            if (!isUsefulRegion(region_kind, parsed.flags, parsed.pathname, exe_name, level))
+            if (!isUsefulRegion(region_kind, parsed.flags, region_filename, exe_name, level))
                 continue;
 
-            const filename_copy = allocator.dupe(u8, parsed.pathname) catch return ProcessError.RegionEnumFailed;
+            const filename_copy = allocator.dupe(u8, region_filename) catch return ProcessError.RegionEnumFailed;
 
             regions.append(allocator, .{
                 .start = parsed.start,
@@ -784,4 +853,134 @@ test "isUsefulRegion: read-only exe region excluded from heap_stack_exe" {
         "/bin/myapp",
         .HEAP_STACK_EXE,
     ));
+}
+
+fn createTestPeFile(io: std.Io, path: []const u8, file_size: usize) !std.Io.File {
+    var header: [0x1000]u8 = @splat(0);
+    header[0] = 'M';
+    header[1] = 'Z';
+    std.mem.writeInt(u32, header[0x3C..0x40], 0x80, .little); // e_lfanew
+    @memcpy(header[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, header[0x98..0x9A], 0x20B, .little); // PE32+ magic
+    std.mem.writeInt(u32, header[0xD0..0xD4], @intCast(3 * std.heap.pageSize()), .little); // SizeOfImage
+    std.mem.writeInt(u32, header[0xD4..0xD8], 0x400, .little); // SizeOfHeaders
+
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = true });
+    errdefer file.close(io);
+
+    try file.writePositionalAll(io, header[0..@min(header.len, file_size)], 0);
+    if (file_size > header.len) try file.writePositionalAll(io, &[_]u8{0}, file_size - 1);
+    return file;
+}
+
+/// Maps "fd" like WINE maps a PE image: file-backed header page at offset 0, an anonymous rw slice and an inaccessible tail.
+fn mapTestPeImage(fd: std.posix.fd_t, page_size: usize) ![]align(std.heap.page_size_min) u8 {
+    const reservation = try std.posix.mmap(null, 3 * page_size, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    errdefer std.posix.munmap(reservation);
+
+    const section_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(@intFromPtr(reservation.ptr) + page_size);
+    _ = try std.posix.mmap(reservation.ptr, page_size, .{ .READ = true }, .{ .TYPE = .PRIVATE, .FIXED = true }, fd, 0);
+    _ = try std.posix.mmap(section_ptr, page_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true }, -1, 0);
+    return reservation;
+}
+
+test "[Linux] readRegions: PE image spans claim WINE style anonymous slices" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const page_size = std.heap.pageSize();
+    const pid = std.os.linux.getpid();
+
+    var exe_path_buf: [64]u8 = undefined;
+    const exe_path = try std.fmt.bufPrint(&exe_path_buf, "/tmp/libmemscan-pe-test-{d}.exe", .{pid});
+    const exe_file = try createTestPeFile(io, exe_path, page_size);
+    defer exe_file.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, exe_path) catch {};
+
+    var dll_path_buf: [64]u8 = undefined;
+    const dll_path = try std.fmt.bufPrint(&dll_path_buf, "/tmp/libmemscan-pe-test-{d}.dll", .{pid});
+    const dll_file = try createTestPeFile(io, dll_path, page_size);
+    defer dll_file.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, dll_path) catch {};
+
+    const exe_mapping = try mapTestPeImage(exe_file.handle, page_size);
+    defer std.posix.munmap(exe_mapping);
+    const dll_mapping = try mapTestPeImage(dll_file.handle, page_size);
+    defer std.posix.munmap(dll_mapping);
+    const exe_base = @intFromPtr(exe_mapping.ptr);
+    const dll_base = @intFromPtr(dll_mapping.ptr);
+
+    var handle = ProcessHandle.attach(io, pid) catch |err| switch (err) {
+        ProcessError.AttachFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer handle.deinit();
+
+    const regions = try handle.readRegions(allocator, .ALL);
+    defer {
+        for (regions) |*region| region.deinit(allocator);
+        allocator.free(regions);
+    }
+
+    var found: u32 = 0;
+    for (regions) |region| {
+        if (region.start == exe_base or region.start == exe_base + page_size) {
+            // Anonymous exe slices adopt the image's filename, file-backed ones already have it.
+            try std.testing.expectEqual(RegionKind.EXE, region.kind);
+            try std.testing.expectEqual(exe_base, region.load_addr);
+            try std.testing.expectEqualStrings(exe_path, region.filename);
+        } else if (region.start == dll_base) {
+            try std.testing.expectEqual(RegionKind.CODE, region.kind);
+            try std.testing.expectEqual(dll_base, region.load_addr);
+            try std.testing.expectEqualStrings(dll_path, region.filename);
+        } else if (region.start == dll_base + page_size) {
+            // Anonymous DLL slices stay unnamed to keep their BSS-like scan level inclusion.
+            try std.testing.expectEqual(RegionKind.CODE, region.kind);
+            try std.testing.expectEqual(dll_base, region.load_addr);
+            try std.testing.expectEqualStrings("", region.filename);
+        } else {
+            continue;
+        }
+        found += 1;
+    }
+    try std.testing.expectEqual(4, found);
+}
+
+test "[Linux] readRegions: flat file mappings of PE data are not image spans" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const page_size = std.heap.pageSize();
+    const pid = std.os.linux.getpid();
+
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/libmemscan-pe-flat-{d}.exe", .{pid});
+    const file = try createTestPeFile(io, path, 2 * page_size);
+    defer file.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    const mapping = try std.posix.mmap(null, 2 * page_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapping);
+
+    var handle = ProcessHandle.attach(io, pid) catch |err| switch (err) {
+        ProcessError.AttachFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer handle.deinit();
+
+    const regions = try handle.readRegions(allocator, .ALL);
+    defer {
+        for (regions) |*region| region.deinit(allocator);
+        allocator.free(regions);
+    }
+
+    var found = false;
+    for (regions) |region| {
+        if (region.start != @intFromPtr(mapping.ptr)) continue;
+        found = true;
+        try std.testing.expectEqual(RegionKind.MISC, region.kind);
+    }
+    try std.testing.expect(found);
 }
