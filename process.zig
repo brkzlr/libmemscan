@@ -217,7 +217,7 @@ const LinuxBackend = struct {
     /// Detect a PE image mapped by WINE starting at this region.
     /// WINE copies most PE sections into anonymous memory since their file offsets are rarely page-aligned,
     /// but it always maps the header page from the file at offset 0.
-    fn detectPeImageSpan(self: *LinuxBackend, io: std.Io, parsed: MapsLine) ?PeImageSpan {
+    fn detectPeImageSpan(self: *LinuxBackend, io: std.Io, parsed: MapsLine, next_line: ?[]const u8) ?PeImageSpan {
         if (parsed.pathname.len == 0 or parsed.pathname[0] != '/' or parsed.offset != 0) return null;
         if (!parsed.flags.read or parsed.end <= parsed.start) return null;
 
@@ -241,7 +241,23 @@ const LinuxBackend = struct {
         const size_of_headers = std.mem.readInt(u32, pe[0x54..0x58], .little);
 
         // Mappings bigger than the headers are whole PE files mmap'd as plain data (Mono assemblies for example), not loaded images.
-        if (slice_size > std.mem.alignForward(u64, size_of_headers, std.heap.pageSize())) return null;
+        // Exception: DEP-off processes (exes without NX_COMPAT) map the header page as executable,
+        // so the kernel merges it with the leading non-writable sections into one VMA ending exactly at the first writable section boundary.
+        if (slice_size > std.mem.alignForward(u64, size_of_headers, std.heap.pageSize())) {
+            if (!parsed.flags.exec) return null;
+            const continuation = parseMapsLine(next_line orelse return null) orelse return null;
+            if (continuation.start != parsed.end or !continuation.flags.write or continuation.offset != slice_size or
+                !std.mem.eql(u8, continuation.pathname, parsed.pathname)) return null;
+            // IMAGE_SECTION_HEADER entries follow the optional header: VirtualAddress at 0x0C, Characteristics at 0x24.
+            var section: usize = pe_offset + 0x18 + std.mem.readInt(u16, pe[0x14..0x16], .little);
+            const boundary = for (0..std.mem.readInt(u16, pe[0x06..0x08], .little)) |_| {
+                if (section + 0x28 > nread) return null;
+                if (std.mem.readInt(u32, header[section + 0x24 ..][0..4], .little) & 0x80000000 != 0) // IMAGE_SCN_MEM_WRITE
+                    break std.mem.readInt(u32, header[section + 0x0C ..][0..4], .little);
+                section += 0x28;
+            } else return null;
+            if (slice_size != std.mem.alignForward(u64, boundary, std.heap.pageSize())) return null;
+        }
         const image_end = parsed.start +| size_of_image;
         if (image_end <= parsed.end) return null;
 
@@ -350,7 +366,7 @@ const LinuxBackend = struct {
                     pe_span = null;
                 }
             }
-            if (pe_span == null) pe_span = self.detectPeImageSpan(io, parsed);
+            if (pe_span == null) pe_span = self.detectPeImageSpan(io, parsed, lines.peek());
 
             // File offsets let all mapped slices of the same ELF image share one load address.
             var region_load_addr = if (parsed.pathname.len > 0 and parsed.offset <= parsed.start)
@@ -861,9 +877,13 @@ fn createTestPeFile(io: std.Io, path: []const u8, file_size: usize) !std.Io.File
     header[1] = 'Z';
     std.mem.writeInt(u32, header[0x3C..0x40], 0x80, .little); // e_lfanew
     @memcpy(header[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, header[0x86..0x88], 1, .little); // NumberOfSections
+    std.mem.writeInt(u16, header[0x94..0x96], 0xF0, .little); // SizeOfOptionalHeader
     std.mem.writeInt(u16, header[0x98..0x9A], 0x20B, .little); // PE32+ magic
     std.mem.writeInt(u32, header[0xD0..0xD4], @intCast(3 * std.heap.pageSize()), .little); // SizeOfImage
     std.mem.writeInt(u32, header[0xD4..0xD8], 0x400, .little); // SizeOfHeaders
+    std.mem.writeInt(u32, header[0x194..0x198], @intCast(2 * std.heap.pageSize()), .little); // section VirtualAddress
+    std.mem.writeInt(u32, header[0x1AC..0x1B0], 0x80000000, .little); // IMAGE_SCN_MEM_WRITE
 
     const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = true });
     errdefer file.close(io);
@@ -947,7 +967,7 @@ test "[Linux] readRegions: PE image spans claim WINE style anonymous slices" {
     try std.testing.expectEqual(4, found);
 }
 
-test "[Linux] readRegions: flat file mappings of PE data are not image spans" {
+test "[Linux] readRegions: oversized PE mapping requires writable continuation" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -957,12 +977,15 @@ test "[Linux] readRegions: flat file mappings of PE data are not image spans" {
 
     var path_buf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/libmemscan-pe-flat-{d}.exe", .{pid});
-    const file = try createTestPeFile(io, path, 2 * page_size);
+    const file = try createTestPeFile(io, path, 3 * page_size);
     defer file.close(io);
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
-    const mapping = try std.posix.mmap(null, 2 * page_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    const mapping = try std.posix.mmap(null, 2 * page_size, .{ .READ = true, .EXEC = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
     defer std.posix.munmap(mapping);
+    const image = try std.posix.mmap(null, 3 * page_size, .{ .READ = true, .WRITE = true, .EXEC = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(image);
+    _ = try std.posix.mmap(image.ptr, 2 * page_size, .{ .READ = true, .EXEC = true }, .{ .TYPE = .PRIVATE, .FIXED = true }, file.handle, 0);
 
     var handle = ProcessHandle.attach(io, pid) catch |err| switch (err) {
         ProcessError.AttachFailed => return error.SkipZigTest,
@@ -976,11 +999,17 @@ test "[Linux] readRegions: flat file mappings of PE data are not image spans" {
         allocator.free(regions);
     }
 
-    var found = false;
+    const image_base = @intFromPtr(image.ptr);
+    var found: u2 = 0;
     for (regions) |region| {
-        if (region.start != @intFromPtr(mapping.ptr)) continue;
-        found = true;
-        try std.testing.expectEqual(RegionKind.MISC, region.kind);
+        if (region.start == @intFromPtr(mapping.ptr)) {
+            try std.testing.expectEqual(RegionKind.CODE, region.kind);
+        } else if (region.start == image_base or region.start == image_base + 2 * page_size) {
+            try std.testing.expectEqual(RegionKind.EXE, region.kind);
+            try std.testing.expectEqual(image_base, region.load_addr);
+            try std.testing.expectEqualStrings(path, region.filename);
+        } else continue;
+        found += 1;
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(3, found);
 }
