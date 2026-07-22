@@ -58,6 +58,8 @@ pub const PointerScanOptions = struct {
     max_positive_offset: usize = 2048,
     /// Maximum negative offset allowed at each pointer dereference.
     max_negative_offset: usize = 0,
+    /// Optional exact value required for the last offset in result paths.
+    last_offset: ?i64 = null,
     /// Optional cap on result paths emitted by one scan.
     max_results: ?u64 = null,
     /// If true, only emit paths whose base address is inside a module.
@@ -741,6 +743,7 @@ pub const PointerPathFinder = struct {
                 const magnitude: i64 = @intCast(difference - 1);
                 break :blk -magnitude - 1;
             };
+            if (self.offset_stack.items.len == 0 and self.options.last_offset != null and offset != self.options.last_offset.?) continue;
 
             // Skip existing addresses to avoid cyclic loops.
             if (std.mem.indexOfScalar(usize, self.address_stack.items, candidate.address) != null) continue;
@@ -1022,6 +1025,7 @@ test "PointerPathFinder: finds static paths from synthetic entries" {
             .pointer_width = @sizeOf(usize),
             .max_depth = 3,
             .max_positive_offset = 0x100,
+            .last_offset = 0x20,
         });
         defer finder.deinit();
 
@@ -1322,7 +1326,7 @@ test "appendEntriesFromChunk: returns zero advance when buffer is smaller than p
     try std.testing.expectEqual(0, entries.items.len);
 }
 
-test "PointerPathFinder: supports negative offsets and result limits" {
+test "PointerPathFinder: supports negative offsets, last-offset filters and result limits" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1331,6 +1335,7 @@ test "PointerPathFinder: supports negative offsets and result limits" {
         .{ .name = "game.exe", .base = 0x2000, .size = 0x100 },
     };
     const entries = [_]PointerEntry{
+        .{ .address = 0x2000, .value = 0x5000 },
         .{ .address = 0x2010, .value = 0x5040 },
         .{ .address = 0x2020, .value = 0x5040 },
     };
@@ -1346,8 +1351,9 @@ test "PointerPathFinder: supports negative offsets and result limits" {
         var finder = try PointerPathFinder.init(std.testing.allocator, &index, &modules, .{
             .pointer_width = @sizeOf(usize),
             .max_depth = 1,
-            .max_positive_offset = 0,
+            .max_positive_offset = 0x20,
             .max_negative_offset = 0x40,
+            .last_offset = -0x20,
             .max_results = 1,
         });
         defer finder.deinit();

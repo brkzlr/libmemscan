@@ -223,6 +223,7 @@ class AbiPointerScanOptions(ctypes.Structure):
         ("max_positive_offset", ctypes.c_size_t),
         ("max_negative_offset", ctypes.c_size_t),
         ("max_results", ctypes.c_uint64),
+        ("last_offset", ctypes.POINTER(ctypes.c_int64)),
     ]
 
 
@@ -424,6 +425,7 @@ class PointerScanOptions:
     max_positive_offset: int = 2048
     max_negative_offset: int = 0
     max_results: Optional[int] = None
+    last_offset: Optional[int] = None
 
 
 class Libmemscan:
@@ -761,6 +763,10 @@ class Libmemscan:
             or not 0 <= options.max_results <= _MAX_U64
         ):
             raise ValueError("max_results must fit in u64")
+        if options.last_offset is not None and (
+            type(options.last_offset) is not int or not -(1 << 63) <= options.last_offset < 1 << 63
+        ):
+            raise ValueError("last_offset must fit in i64")
         if type(options.module_base_only) is not bool:
             raise ValueError("module_base_only must be a bool")
 
@@ -779,6 +785,9 @@ class Libmemscan:
         raw.max_positive_offset = options.max_positive_offset
         raw.max_negative_offset = options.max_negative_offset
         raw.max_results = 0 if options.max_results is None else options.max_results
+        raw.last_offset = (
+            ctypes.pointer(ctypes.c_int64(options.last_offset)) if options.last_offset is not None else None
+        )
         return raw
 
     def pointer_scan(self, target_address: int, output_map_path: object, options: PointerScanOptions) -> int:

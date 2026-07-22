@@ -177,6 +177,7 @@ pub const LmPointerScanOptions = extern struct {
     max_positive_offset: usize,
     max_negative_offset: usize,
     max_results: u64,
+    last_offset: ?*const i64,
 };
 
 const lm_max_offsets_per_path = pointerscan.PointerMapHeader.max_offsets_per_path;
@@ -550,6 +551,7 @@ pub export fn lm_pointer_scan(raw: ?*LmScanner, target_address: usize, output_ma
         .max_depth = abi.max_depth,
         .max_positive_offset = abi.max_positive_offset,
         .max_negative_offset = abi.max_negative_offset,
+        .last_offset = if (abi.last_offset) |last_offset| last_offset.* else null,
         .max_results = if (abi.has_max_results) abi.max_results else null,
         .module_base_only = abi.module_base_only,
     };
