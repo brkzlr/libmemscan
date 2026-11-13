@@ -434,7 +434,7 @@ pub const MatchesArray = struct {
         while (self.chunks.items.len > 0 and self.chunks.items[0].base + self.chunks.items[0].data.len <= offset) {
             const chunk = self.chunks.items[0];
             self.allocator.free(chunk.data);
-            std.mem.copyForwards(Chunk, self.chunks.items[0 .. self.chunks.items.len - 1], self.chunks.items[1..]);
+            @memmove(self.chunks.items[0 .. self.chunks.items.len - 1], self.chunks.items[1..]);
             _ = self.chunks.pop();
         }
     }

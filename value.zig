@@ -265,35 +265,35 @@ pub const UserValue = struct {
 
         if (number >= 0 and number <= std.math.maxInt(u8)) {
             result.flags.u8b = true;
-            result.uint8_value = @intFromFloat(number);
+            result.uint8_value = @trunc(number);
         }
         if (number >= std.math.minInt(i8) and number <= std.math.maxInt(i8)) {
             result.flags.s8b = true;
-            result.int8_value = @intFromFloat(number);
+            result.int8_value = @trunc(number);
         }
         if (number >= 0 and number <= std.math.maxInt(u16)) {
             result.flags.u16b = true;
-            result.uint16_value = @intFromFloat(number);
+            result.uint16_value = @trunc(number);
         }
         if (number >= std.math.minInt(i16) and number <= std.math.maxInt(i16)) {
             result.flags.s16b = true;
-            result.int16_value = @intFromFloat(number);
+            result.int16_value = @trunc(number);
         }
         if (number >= 0 and number <= std.math.maxInt(u32)) {
             result.flags.u32b = true;
-            result.uint32_value = @intFromFloat(number);
+            result.uint32_value = @trunc(number);
         }
         if (number >= std.math.minInt(i32) and number <= std.math.maxInt(i32)) {
             result.flags.s32b = true;
-            result.int32_value = @intFromFloat(number);
+            result.int32_value = @trunc(number);
         }
         if (number >= 0 and number < @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
             result.flags.u64b = true;
-            result.uint64_value = @intFromFloat(number);
+            result.uint64_value = @trunc(number);
         }
         if (number >= std.math.minInt(i64) and number < @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
             result.flags.s64b = true;
-            result.int64_value = @intFromFloat(number);
+            result.int64_value = @trunc(number);
         }
 
         return result;

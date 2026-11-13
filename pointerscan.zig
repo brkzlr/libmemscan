@@ -51,7 +51,7 @@ pub const PointerScanOptions = struct {
     /// Width of pointers read from target memory. Must be 4 for 32-bit targets and 8 for 64-bit targets.
     pointer_width: u8,
     /// Endianness used when decoding pointer values from target memory.
-    endianness: std.builtin.Endian = .native,
+    endianness: std.lang.Endian = .native,
     /// Maximum number of offsets in a result path.
     max_depth: u8 = 5,
     /// Maximum positive offset allowed at each pointer dereference.
@@ -465,7 +465,7 @@ pub const PointerMapWriter = struct {
         };
 
         var record: [path_record_fixed_size + PointerMapHeader.max_offsets_per_path * @sizeOf(i64)]u8 = undefined;
-        record[0] = @intFromEnum(encoded_base.kind);
+        record[0] = @backingInt(encoded_base.kind);
         @memset(record[1..4], 0);
         std.mem.writeInt(u32, record[4..8], encoded_base.module_index, PointerMapHeader.endianness);
         std.mem.writeInt(u64, record[8..16], encoded_base.payload, PointerMapHeader.endianness);
@@ -595,14 +595,14 @@ pub const PointerMapReader = struct {
         const module_index = std.mem.readInt(u32, record[4..8], PointerMapHeader.endianness);
         const base_payload = std.mem.readInt(u64, record[8..16], PointerMapHeader.endianness);
         const base: PointerBase = switch (kind_raw) {
-            @intFromEnum(PointerBaseKind.module) => blk: {
+            @backingInt(PointerBaseKind.module) => blk: {
                 if (module_index >= self.modules.len) return PointerScanError.InvalidMapFormat;
                 break :blk .{ .module = .{
                     .module_index = module_index,
                     .offset = @bitCast(base_payload),
                 } };
             },
-            @intFromEnum(PointerBaseKind.absolute) => blk: {
+            @backingInt(PointerBaseKind.absolute) => blk: {
                 if (module_index != 0) return PointerScanError.InvalidMapFormat;
                 break :blk .{ .absolute = std.math.cast(usize, base_payload) orelse return PointerScanError.InvalidMapFormat };
             },
@@ -746,7 +746,7 @@ pub const PointerPathFinder = struct {
             if (self.offset_stack.items.len == 0 and self.options.last_offset != null and offset != self.options.last_offset.?) continue;
 
             // Skip existing addresses to avoid cyclic loops.
-            if (std.mem.indexOfScalar(usize, self.address_stack.items, candidate.address) != null) continue;
+            if (std.mem.findScalar(usize, self.address_stack.items, candidate.address) != null) continue;
 
             try self.offset_stack.appendBounded(offset);
             defer _ = self.offset_stack.pop();
@@ -1647,7 +1647,7 @@ test "PointerMapReader: rejects corrupt path records" {
         try writeTestMapHeader(io, file, 8, 0, 1);
 
         var record: [test_path_record_header_size]u8 = @splat(0);
-        record[0] = @intFromEnum(PointerBaseKind.absolute);
+        record[0] = @backingInt(PointerBaseKind.absolute);
         std.mem.writeInt(u64, record[8..16], 0x1000, PointerMapHeader.endianness);
         std.mem.writeInt(u32, record[16..20], PointerMapHeader.max_offsets_per_path + 1, PointerMapHeader.endianness);
         try file.writePositionalAll(io, &record, PointerMapHeader.size);
@@ -1661,7 +1661,7 @@ test "PointerMapReader: rejects corrupt path records" {
         try writeTestMapHeader(io, file, 8, 0, 1);
 
         var record: [test_path_record_header_size]u8 = @splat(0);
-        record[0] = @intFromEnum(PointerBaseKind.absolute);
+        record[0] = @backingInt(PointerBaseKind.absolute);
         record[1] = 1;
         try file.writePositionalAll(io, &record, PointerMapHeader.size);
         file.close(io);
@@ -1686,7 +1686,7 @@ test "PointerMapReader: rejects corrupt path records" {
         try writeTestMapHeader(io, file, 8, 0, 1);
 
         var record: [test_path_record_header_size]u8 = @splat(0);
-        record[0] = @intFromEnum(PointerBaseKind.absolute);
+        record[0] = @backingInt(PointerBaseKind.absolute);
         std.mem.writeInt(u32, record[4..8], 1, PointerMapHeader.endianness);
         try file.writePositionalAll(io, &record, PointerMapHeader.size);
         file.close(io);
@@ -1699,7 +1699,7 @@ test "PointerMapReader: rejects corrupt path records" {
         try writeTestMapHeader(io, file, 8, 0, 1);
 
         var record: [test_path_record_header_size]u8 = @splat(0);
-        record[0] = @intFromEnum(PointerBaseKind.module);
+        record[0] = @backingInt(PointerBaseKind.module);
         try file.writePositionalAll(io, &record, PointerMapHeader.size);
         file.close(io);
 
@@ -1711,7 +1711,7 @@ test "PointerMapReader: rejects corrupt path records" {
         try writeTestMapHeader(io, file, 8, 0, 1);
 
         var record: [test_path_record_header_size]u8 = @splat(0);
-        record[0] = @intFromEnum(PointerBaseKind.absolute);
+        record[0] = @backingInt(PointerBaseKind.absolute);
         std.mem.writeInt(u32, record[16..20], 1, PointerMapHeader.endianness);
         try file.writePositionalAll(io, &record, PointerMapHeader.size);
         file.close(io);

@@ -1243,10 +1243,9 @@ pub const Scanner = struct {
     }
 
     /// Fixed concrete numeric MATCHEQUALTO over a full-shared stride-1 segment.
-    /// Searches the segment's current bytes with "std.mem.indexOfPos" against pre-serialized needle(s)
-    /// instead of running the compare kernel at every candidate.
+    /// Searches the segment's current bytes with "std.mem.findPos" against pre-serialized needles instead of running the compare kernel at every candidate.
     /// Safe because "fullSharedSegmentWidth" plus stride 1 guarantees every hit before "valid" is in the old candidate set.
-    /// Read failures fall back to the iterator path (which uses "kernel") so partial reads still respect the old candidate set.
+    /// Read failures fall back to the iterator path, which uses "kernel".
     fn rescanExactFullSegment(
         self: *Scanner,
         old_matches: *const MatchesArray,
@@ -1278,8 +1277,8 @@ pub const Scanner = struct {
                 return;
             }
 
-            var hit_primary = std.mem.indexOfPos(u8, current, 0, needles.primary);
-            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.indexOfPos(u8, current, 0, sec) else null;
+            var hit_primary = std.mem.findPos(u8, current, 0, needles.primary);
+            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.findPos(u8, current, 0, sec) else null;
 
             while (true) {
                 var h: usize = undefined;
@@ -1317,17 +1316,17 @@ pub const Scanner = struct {
                         const trailing_offset = burst_end - 1 + width;
                         const trailing_end = std.math.add(usize, address, trailing_offset) catch return ScannerError.ReadFailed;
                         writer.pending_end = @max(writer.pending_end, trailing_end);
-                        hit_primary = std.mem.indexOfPos(u8, current, burst_end, needles.primary);
+                        hit_primary = std.mem.findPos(u8, current, burst_end, needles.primary);
                         if (hit_secondary) |h2| {
                             if (h2 < burst_end) {
-                                hit_secondary = std.mem.indexOfPos(u8, current, burst_end, needles.secondary.?);
+                                hit_secondary = std.mem.findPos(u8, current, burst_end, needles.secondary.?);
                             }
                         }
                         continue;
                     }
-                    hit_primary = std.mem.indexOfPos(u8, current, h + 1, needles.primary);
+                    hit_primary = std.mem.findPos(u8, current, h + 1, needles.primary);
                 } else {
-                    hit_secondary = std.mem.indexOfPos(u8, current, h + 1, needles.secondary.?);
+                    hit_secondary = std.mem.findPos(u8, current, h + 1, needles.secondary.?);
                 }
 
                 try writer.appendMatch(address + h, current[h], width, needles.raw_bits);
@@ -1921,31 +1920,31 @@ pub const Scanner = struct {
     fn ensureUndoFile(self: *Scanner) ScannerError!*std.Io.File {
         if (self.undo_file == null) {
             const cache_dir = cache_dir: {
-                switch (builtin.os.tag) {
+                switch (builtin.target.os.tag) {
                     .linux => {
                         if (std.c.getenv("XDG_CACHE_HOME")) |xdg_cache_home_raw| {
                             const xdg_cache_home = std.mem.span(xdg_cache_home_raw);
-                            if (xdg_cache_home.len != 0 and std.fs.path.isAbsolute(xdg_cache_home)) {
-                                break :cache_dir std.fs.path.join(self.allocator, &.{ xdg_cache_home, "libmemscan" }) catch return ScannerError.OutOfMemory;
+                            if (xdg_cache_home.len != 0 and std.Io.Dir.path.isAbsolute(xdg_cache_home)) {
+                                break :cache_dir std.Io.Dir.path.join(self.allocator, &.{ xdg_cache_home, "libmemscan" }) catch return ScannerError.OutOfMemory;
                             }
                         }
 
                         const home = std.mem.span(std.c.getenv("HOME") orelse return ScannerError.UndoIoFailed);
-                        if (home.len == 0 or !std.fs.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
-                        break :cache_dir std.fs.path.join(self.allocator, &.{ home, ".cache", "libmemscan" }) catch return ScannerError.OutOfMemory;
+                        if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
+                        break :cache_dir std.Io.Dir.path.join(self.allocator, &.{ home, ".cache", "libmemscan" }) catch return ScannerError.OutOfMemory;
                     },
                     .macos => {
                         const home = std.mem.span(std.c.getenv("HOME") orelse return ScannerError.UndoIoFailed);
-                        if (home.len == 0 or !std.fs.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
-                        break :cache_dir std.fs.path.join(self.allocator, &.{ home, "Library", "Caches", "libmemscan" }) catch return ScannerError.OutOfMemory;
+                        if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return ScannerError.UndoIoFailed;
+                        break :cache_dir std.Io.Dir.path.join(self.allocator, &.{ home, "Library", "Caches", "libmemscan" }) catch return ScannerError.OutOfMemory;
                     },
-                    else => @compileError("Unsupported platform: " ++ @tagName(builtin.os.tag)),
+                    else => @compileError("Unsupported platform: " ++ @tagName(builtin.target.os.tag)),
                 }
             };
             defer self.allocator.free(cache_dir);
 
             std.Io.Dir.createDirPath(.cwd(), self.io, cache_dir) catch return ScannerError.UndoIoFailed;
-            const undo_path = std.fs.path.join(self.allocator, &.{ cache_dir, "libmemscan-undo.bin" }) catch return ScannerError.OutOfMemory;
+            const undo_path = std.Io.Dir.path.join(self.allocator, &.{ cache_dir, "libmemscan-undo.bin" }) catch return ScannerError.OutOfMemory;
             errdefer self.allocator.free(undo_path);
 
             self.undo_file = std.Io.Dir.createFileAbsolute(self.io, undo_path, .{
@@ -1982,8 +1981,8 @@ pub const Scanner = struct {
             .match_count = matches.match_count,
             .stride = matches.stride,
             .alignment = self.options.alignment,
-            .scan_data_type = @intFromEnum(self.options.scan_data_type),
-            .scan_level = @intFromEnum(self.options.scan_level),
+            .scan_data_type = @backingInt(self.options.scan_data_type),
+            .scan_level = @backingInt(self.options.scan_level),
             .reverse_endianness = @intFromBool(self.options.reverse_endianness),
         };
 
@@ -2035,8 +2034,8 @@ pub const Scanner = struct {
             .num_matches = header.num_matches,
             .options = .{
                 .alignment = header.alignment,
-                .scan_data_type = @enumFromInt(header.scan_data_type),
-                .scan_level = @enumFromInt(header.scan_level),
+                .scan_data_type = @fromBackingInt(@intCast(header.scan_data_type)),
+                .scan_level = @fromBackingInt(@intCast(header.scan_level)),
                 .reverse_endianness = header.reverse_endianness != 0,
             },
         };
@@ -2070,7 +2069,7 @@ const MemoryCache = struct {
                     var shift_size = addr - base;
                     shift_size = read_chunk_size * (shift_size / read_chunk_size);
 
-                    std.mem.copyForwards(u8, self.cache[0 .. self.size - shift_size], self.cache[shift_size..self.size]);
+                    @memmove(self.cache[0 .. self.size - shift_size], self.cache[shift_size..self.size]);
                     self.size -= shift_size;
                     self.base = base + shift_size;
                 }
@@ -2322,7 +2321,7 @@ fn scanChunkIntoMatches(
         var pending_next: usize = 0;
         var pending_end = required_extra_bytes.*;
         var search_pos: usize = 0;
-        while (std.mem.indexOfPos(u8, chunk, search_pos, needle)) |hit| {
+        while (std.mem.findPos(u8, chunk, search_pos, needle)) |hit| {
             if (hit >= scan_limit) break;
             search_pos = hit + 1;
             const absolute_address = base_address + hit;
@@ -2361,8 +2360,8 @@ fn scanChunkIntoMatches(
 
         // Pick the longest contiguous FIXED-byte run in the pattern as the search anchor.
         // A single-byte anchor (the old behaviour) is a worst case when that byte is common (e.g. 0x00 in C string padding)
-        // and also can't use std.mem.indexOfPos' multi-byte memmem acceleration.
-        // Longest-run wins both: it suppresses false anchor hits and lets indexOfPos rip through dense chunks.
+        // and also can't use std.mem.findPos' multi-byte memmem acceleration.
+        // Longest-run wins both: it suppresses false anchor hits and lets findPos rip through dense chunks.
         // A no-FIXED pattern (rare but legal) falls through to the all-wildcard aligned walk below.
         var anchor_start: usize = 0;
         var anchor_len: usize = 0;
@@ -2384,7 +2383,7 @@ fn scanChunkIntoMatches(
         if (anchor_len > 0) {
             const needle = pattern[anchor_start .. anchor_start + anchor_len];
             var search_pos: usize = anchor_start;
-            while (std.mem.indexOfPos(u8, chunk, search_pos, needle)) |hit| {
+            while (std.mem.findPos(u8, chunk, search_pos, needle)) |hit| {
                 if (hit < anchor_start) {
                     search_pos = hit + 1;
                     continue;
@@ -2435,7 +2434,7 @@ fn scanChunkIntoMatches(
     }
 
     // Fixed concrete numeric MATCHEQUALTO: serialize the target value(s) once and search the chunk
-    // with std.mem.indexOfPos instead of running the compare kernel at every candidate.
+    // with std.mem.findPos instead of running the compare kernel at every candidate.
     // Preserves alignment filtering, overlap (search advances by hit+1), and the trailing-byte pending-span pattern.
     // Float zero exact uses two needles for +0.0 and -0.0 (different bit patterns, equal under the kernel's ""==" semantics).
     // Float NaN exact matches nothing.
@@ -2446,8 +2445,8 @@ fn scanChunkIntoMatches(
         if (serializeExactNumericNeedles(prepared.data_type, user_values[0], prepared.reverse_endianness, &primary_buf, &secondary_buf)) |needles| {
             var pending_next: usize = 0;
             var pending_end = required_extra_bytes.*;
-            var hit_primary = std.mem.indexOfPos(u8, chunk, 0, needles.primary);
-            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.indexOfPos(u8, chunk, 0, sec) else null;
+            var hit_primary = std.mem.findPos(u8, chunk, 0, needles.primary);
+            var hit_secondary: ?usize = if (needles.secondary) |sec| std.mem.findPos(u8, chunk, 0, sec) else null;
 
             while (true) {
                 var h: usize = undefined;
@@ -2471,9 +2470,9 @@ fn scanChunkIntoMatches(
                 } else break;
                 if (h >= scan_limit) break;
                 if (consumed_primary) {
-                    hit_primary = std.mem.indexOfPos(u8, chunk, h + 1, needles.primary);
+                    hit_primary = std.mem.findPos(u8, chunk, h + 1, needles.primary);
                 } else {
-                    hit_secondary = std.mem.indexOfPos(u8, chunk, h + 1, needles.secondary.?);
+                    hit_secondary = std.mem.findPos(u8, chunk, h + 1, needles.secondary.?);
                 }
 
                 const absolute_address = base_address + h;
@@ -2501,10 +2500,10 @@ fn scanChunkIntoMatches(
                         num_matches.* += burst_len;
                         pending_next = burst_end;
                         pending_end = @max(pending_end, burst_end - step + needles.primary.len);
-                        hit_primary = std.mem.indexOfPos(u8, chunk, burst_end, needles.primary);
+                        hit_primary = std.mem.findPos(u8, chunk, burst_end, needles.primary);
                         if (hit_secondary) |s2| {
                             if (s2 < burst_end) {
-                                hit_secondary = std.mem.indexOfPos(u8, chunk, burst_end, needles.secondary.?);
+                                hit_secondary = std.mem.findPos(u8, chunk, burst_end, needles.secondary.?);
                             }
                         }
                         continue;
@@ -2694,7 +2693,7 @@ fn matchAnyRawBitsForStoredLength(data_type: ScanDataType, stored_len: usize) u1
 fn bytearrayMatches(memory: []const u8, pattern: []const u8, wildcards: []const value_mod.Wildcard) bool {
     if (pattern.len != wildcards.len or memory.len < pattern.len) return false;
     for (pattern, wildcards, 0..) |byte, wildcard, i| {
-        if (byte != (memory[i] & @intFromEnum(wildcard))) return false;
+        if (byte != (memory[i] & @backingInt(wildcard))) return false;
     }
     return true;
 }
@@ -3104,7 +3103,7 @@ test "scanPointers: scans process memory and writes direct and nested pointer pa
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
     var map_path_buffer: [128]u8 = undefined;
-    const map_path = try std.fmt.bufPrint(&map_path_buffer, "/tmp/libmemscan-pointer-scan-{d}-{x}.lmptr", .{
+    const map_path = try std.mem.print(&map_path_buffer, "/tmp/libmemscan-pointer-scan-{d}-{x}.lmptr", .{
         pid,
         std.mem.readInt(u64, &random_bytes, .native),
     });
@@ -4090,7 +4089,7 @@ test "rescanMatches: fixed integer exact full segment direct search confines hit
     // Full stride-1 width-4 segment of exactly 4 candidates (offsets 0..3).
     // appendRun with len==candidate_count yields match_count==candidate_count,
     // which is what fullSharedSegmentWidth requires before dispatching into
-    // the indexOfPos-based rescanExactFullSegment path.
+    // the findPos-based rescanExactFullSegment path.
     const old_values: [4]u8 = @splat(0);
     var matches = try MatchesArray.init(allocator, 256, 1);
     try matches.appendRun(base_address, &old_values, MatchFlags.i32b.bits(), old_values.len);
@@ -4106,7 +4105,7 @@ test "rescanMatches: fixed integer exact full segment direct search confines hit
     try scanner.rescanMatches(.MATCHEQUALTO, &.{user});
 
     try scanner.matches.?.validate();
-    // Only the in-segment 0x42 survives. indexOfPos can see the 0x42 at offset 8 in the read window,
+    // Only the in-segment 0x42 survives. findPos can see the 0x42 at offset 8 in the read window,
     // but the "h >= valid" guard inside rescanExactFullSegment rejects it because candidate index 8 was never
     // in the prior match set.
     try std.testing.expectEqual(1, scanner.matchCount());
@@ -4781,7 +4780,7 @@ test "rescanMatches: anyfloat delta full segment gates unchanged f32 window" {
 
     var memory: [8]u8 = undefined;
     var old_bytes: [8]u8 = undefined;
-    if (builtin.cpu.arch.endian() == .little) {
+    if (builtin.target.cpu.arch.endian() == .little) {
         const old_value: f64 = 1.0;
         const current_value: f64 = 2.0;
         std.mem.writeInt(u64, &old_bytes, @bitCast(old_value), .native);
@@ -4992,7 +4991,7 @@ test "rescanMatches: anynumber delta full segment gates unchanged sub-width wind
 
     var memory: [8]u8 = undefined;
     var old_bytes: [8]u8 = undefined;
-    if (builtin.cpu.arch.endian() == .little) {
+    if (builtin.target.cpu.arch.endian() == .little) {
         const old_value: f64 = 1.0;
         const current_value: f64 = 2.0;
         std.mem.writeInt(u64, &old_bytes, @bitCast(old_value), .native);
@@ -5527,7 +5526,7 @@ test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO direct search records overlap
     };
 
     // 6 consecutive 0x01 bytes contain INTEGER32 0x01010101 at offsets 0, 1, 2 (overlapping).
-    // The indexOfPos-based path must advance by hit+1 to find every overlap and
+    // The findPos-based path must advance by hit+1 to find every overlap and
     // not skip past matches like a stride-of-width loop would.
     const chunk = [_]u8{ 1, 1, 1, 1, 1, 1, 9 };
     var required_extra: usize = 0;
@@ -5554,7 +5553,7 @@ test "scanChunkIntoMatches: INTEGER32 MATCHEQUALTO direct search honors alignmen
     };
 
     // INTEGER32 needle [0x42, 0, 0, 0] appears at offsets 0 (aligned), 5 (unaligned), and 12 (aligned).
-    // The alignment gate must reject the h=5 hit even though indexOfPos finds it.
+    // The alignment gate must reject the h=5 hit even though findPos finds it.
     const chunk = [_]u8{ 0x42, 0, 0, 0, 9, 0x42, 0, 0, 0, 9, 9, 9, 0x42, 0, 0, 0 };
     var required_extra: usize = 0;
     var num_matches: usize = 0;
@@ -6197,7 +6196,7 @@ test "scanChunkIntoMatches: bytearray exact picks longest fixed run when it's no
     try std.testing.expectEqualSlices(u8, chunk[8..14], matches.dataToBytes(m.swath_offset, m.index, 6, &stored));
 }
 
-test "scanChunkIntoMatches: bytearray exact no-wildcard finds overlapping matches via multi-byte indexOfPos" {
+test "scanChunkIntoMatches: bytearray exact no-wildcard finds overlapping matches via multi-byte findPos" {
     var matches = try MatchesArray.init(std.testing.allocator, 4096, 1);
     defer matches.deinit();
 

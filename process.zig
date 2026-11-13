@@ -77,10 +77,10 @@ pub const ProcessError = error{
     RegionEnumFailed,
 };
 
-const PlatformBackend = switch (builtin.os.tag) {
+const PlatformBackend = switch (builtin.target.os.tag) {
     .linux => LinuxBackend,
     .macos => MacOSBackend,
-    else => @compileError("Unsupported platform: " ++ @tagName(builtin.os.tag)),
+    else => @compileError("Unsupported platform: " ++ @tagName(builtin.target.os.tag)),
 };
 
 pub const ProcessHandle = struct {
@@ -170,7 +170,7 @@ fn parseMapsLine(line: []const u8) ?MapsLine {
 
     // field 1: "start-end"
     const addr_field = it.next() orelse return null;
-    const dash = std.mem.indexOfScalar(u8, addr_field, '-') orelse return null;
+    const dash = std.mem.findScalar(u8, addr_field, '-') orelse return null;
     const start = std.fmt.parseUnsigned(usize, addr_field[0..dash], 16) catch return null;
     const end = std.fmt.parseUnsigned(usize, addr_field[dash + 1 ..], 16) catch return null;
 
@@ -271,7 +271,7 @@ const LinuxBackend = struct {
 
     fn attach(io: std.Io, pid: std.posix.pid_t) ProcessError!LinuxBackend {
         var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/mem", .{pid}) catch return ProcessError.AttachFailed;
+        const path = std.mem.print(&path_buf, "/proc/{d}/mem", .{pid}) catch return ProcessError.AttachFailed;
 
         const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return ProcessError.AttachFailed;
 
@@ -308,14 +308,14 @@ const LinuxBackend = struct {
 
     fn readRegions(self: *LinuxBackend, io: std.Io, pid: std.posix.pid_t, allocator: std.mem.Allocator, level: ScanLevel) ProcessError![]Region {
         var path_buf: [64]u8 = undefined;
-        const maps_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/maps", .{pid}) catch return ProcessError.RegionEnumFailed;
+        const maps_path = std.mem.print(&path_buf, "/proc/{d}/maps", .{pid}) catch return ProcessError.RegionEnumFailed;
 
         const maps_file = std.Io.Dir.openFileAbsolute(io, maps_path, .{}) catch return ProcessError.RegionEnumFailed;
         defer maps_file.close(io);
 
         // resolve the executable path via /proc/<pid>/exe
         var exe_path_buf: [64]u8 = undefined;
-        const exe_link_path = std.fmt.bufPrint(&exe_path_buf, "/proc/{d}/exe", .{pid}) catch return ProcessError.RegionEnumFailed;
+        const exe_link_path = std.mem.print(&exe_path_buf, "/proc/{d}/exe", .{pid}) catch return ProcessError.RegionEnumFailed;
 
         var exe_name_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const exe_name_len = std.Io.Dir.readLinkAbsolute(io, exe_link_path, &exe_name_buf) catch 0;
@@ -596,7 +596,7 @@ const MacOSBackend = struct {
         if (exe_name_raw_len > 0) {
             const exe_name_len: usize = @intCast(@min(exe_name_raw_len, exe_name_buf.len));
             const exe_name_path = exe_name_buf[0..exe_name_len];
-            exe_name = exe_name_path[0 .. std.mem.indexOfScalar(u8, exe_name_path, 0) orelse exe_name_path.len];
+            exe_name = exe_name_path[0 .. std.mem.findScalar(u8, exe_name_path, 0) orelse exe_name_path.len];
             if (exe_name.len < exe_name_buf.len) {
                 exe_name_buf[exe_name.len] = 0;
                 exe_has_identity = std.c.fstatat(std.c.AT.FDCWD, @ptrCast(exe_name_buf[0..].ptr), &exe_stat, 0) == 0;
@@ -649,7 +649,7 @@ const MacOSBackend = struct {
             if (filename_raw_len > 0) {
                 const filename_len: usize = @intCast(@min(filename_raw_len, filename_buf.len));
                 const filename_path = filename_buf[0..filename_len];
-                filename = filename_path[0 .. std.mem.indexOfScalar(u8, filename_path, 0) orelse filename_path.len];
+                filename = filename_path[0 .. std.mem.findScalar(u8, filename_path, 0) orelse filename_path.len];
             }
 
             // If region has a filename, let's grab the fstat so we can also compare using dev and ino
@@ -905,7 +905,7 @@ fn mapTestPeImage(fd: std.posix.fd_t, page_size: usize) ![]align(std.heap.page_s
 }
 
 test "[Linux] readRegions: PE image spans claim WINE style anonymous slices" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -913,13 +913,13 @@ test "[Linux] readRegions: PE image spans claim WINE style anonymous slices" {
     const pid = std.os.linux.getpid();
 
     var exe_path_buf: [64]u8 = undefined;
-    const exe_path = try std.fmt.bufPrint(&exe_path_buf, "/tmp/libmemscan-pe-test-{d}.exe", .{pid});
+    const exe_path = try std.mem.print(&exe_path_buf, "/tmp/libmemscan-pe-test-{d}.exe", .{pid});
     const exe_file = try createTestPeFile(io, exe_path, page_size);
     defer exe_file.close(io);
     defer std.Io.Dir.deleteFileAbsolute(io, exe_path) catch {};
 
     var dll_path_buf: [64]u8 = undefined;
-    const dll_path = try std.fmt.bufPrint(&dll_path_buf, "/tmp/libmemscan-pe-test-{d}.dll", .{pid});
+    const dll_path = try std.mem.print(&dll_path_buf, "/tmp/libmemscan-pe-test-{d}.dll", .{pid});
     const dll_file = try createTestPeFile(io, dll_path, page_size);
     defer dll_file.close(io);
     defer std.Io.Dir.deleteFileAbsolute(io, dll_path) catch {};
@@ -968,7 +968,7 @@ test "[Linux] readRegions: PE image spans claim WINE style anonymous slices" {
 }
 
 test "[Linux] readRegions: oversized PE mapping requires writable continuation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -976,7 +976,7 @@ test "[Linux] readRegions: oversized PE mapping requires writable continuation" 
     const pid = std.os.linux.getpid();
 
     var path_buf: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/libmemscan-pe-flat-{d}.exe", .{pid});
+    const path = try std.mem.print(&path_buf, "/tmp/libmemscan-pe-flat-{d}.exe", .{pid});
     const file = try createTestPeFile(io, path, 3 * page_size);
     defer file.close(io);
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
